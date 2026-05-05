@@ -413,25 +413,41 @@ class PropertiesDialog(QDialog):
         fmt = self._safe_get(p, "file-format", "?")
         size = self._safe_get(p, "file-size")
         dur = self._safe_get(p, "duration") or owner._duration
-        v_codec_friendly = self._safe_get(p, "video-codec", "")
-        v_codec_id = self._safe_get(p, "video-format", "")
-        a_codec_friendly = self._safe_get(p, "audio-codec", "")
-        a_codec_id = self._safe_get(p, "audio-codec-name", "")
         hwdec = self._safe_get(p, "hwdec-current", "no") or "no"
         fps = self._safe_get(p, "container-fps") or self._safe_get(p, "estimated-vf-fps")
+
+        # track-list is the most reliable source of per-stream codec info —
+        # populated at file-load time and structured. The bare video-codec /
+        # audio-codec properties sometimes return empty in main-thread reads.
+        tracks = self._safe_get(p, "track-list", []) or []
+        if not isinstance(tracks, (list, tuple)):
+            tracks = []
+        v_track = next((t for t in tracks if isinstance(t, dict)
+                        and t.get("type") == "video" and t.get("selected")), {})
+        a_track = next((t for t in tracks if isinstance(t, dict)
+                        and t.get("type") == "audio" and t.get("selected")), {})
+
+        v_codec_id = v_track.get("codec") or self._safe_get(p, "video-format", "")
+        v_codec_friendly = v_track.get("codec-desc") or self._safe_get(p, "video-codec", "") or v_codec_id
+        a_codec_id = a_track.get("codec") or self._safe_get(p, "audio-codec-name", "")
+        a_codec_friendly = a_track.get("codec-desc") or self._safe_get(p, "audio-codec", "") or a_codec_id
+
+        # Resolution / fps fallbacks from track-list when video-params is empty.
+        v_track_w = v_track.get("demux-w") or v_track.get("w")
+        v_track_h = v_track.get("demux-h") or v_track.get("h")
+        v_track_fps = v_track.get("demux-fps")
+        if not fps and v_track_fps:
+            fps = v_track_fps
 
         # Prefer cached observer state; fall back to fresh read.
         vp = owner._video_params or _to_plain_dict(self._safe_get(p, "video-params"))
         ap = owner._audio_params or _to_plain_dict(self._safe_get(p, "audio-params"))
         md = owner._metadata or _to_plain_dict(self._safe_get(p, "metadata"))
 
-        # One-line debug dump so we can see what mpv really gave us when the
-        # dialog looks empty.
+        # Debug: see what mpv gave us if the dialog still looks empty.
         sys.stderr.write(
-            f"[props] codec_friendly={v_codec_friendly!r} codec_id={v_codec_id!r} "
-            f"acodec={a_codec_friendly!r} fmt={fmt!r} fps={fps!r} hwdec={hwdec!r}\n"
-            f"[props] video_params keys={list(vp.keys())[:8]}\n"
-            f"[props] metadata keys={list(md.keys())[:8]}\n"
+            f"[props] tracks={len(tracks)} v_codec={v_codec_friendly!r}/{v_codec_id!r} "
+            f"a_codec={a_codec_friendly!r}/{a_codec_id!r} fmt={fmt!r} fps={fps!r} hwdec={hwdec!r}\n"
         )
 
         rows: list[str] = []
@@ -471,11 +487,12 @@ class PropertiesDialog(QDialog):
             row("Codec", f"{v_codec_friendly}  ({v_codec_id})")
         else:
             row("Codec", v_codec_friendly or v_codec_id)
+        # Resolution: prefer video-params (renderer's truth) then track demux-w/h.
+        w = (vp.get("w") or vp.get("dw") or v_track_w) if vp or v_track_w else None
+        h = (vp.get("h") or vp.get("dh") or v_track_h) if vp or v_track_h else None
+        if w and h:
+            row("Resolution", f"{w}x{h}")
         if vp:
-            w = vp.get("w") or vp.get("dw")
-            h = vp.get("h") or vp.get("dh")
-            if w and h:
-                row("Resolution", f"{w}x{h}")
             pixfmt = vp.get("pixelformat") or vp.get("hw-pixelformat")
             if pixfmt:
                 row("Pixel format", _decode_pixfmt(pixfmt))
@@ -742,12 +759,21 @@ class PlayerWindow(QMainWindow):
         act_stop.triggered.connect(self.stop_playback)
         playback_menu.addAction(act_stop)
         playback_menu.addSeparator()
-        act_back10 = QAction("Step Back 10s", self, shortcut="Left")
+        # Shortcuts (Left/Right, comma/period) are registered globally in
+        # _install_global_shortcuts so they survive fullscreen. We just label
+        # them here for menu discoverability.
+        act_back10 = QAction("Step Back 10s\tLeft", self)
         act_back10.triggered.connect(lambda: self.seek_relative(-10))
         playback_menu.addAction(act_back10)
-        act_fwd10 = QAction("Step Forward 10s", self, shortcut="Right")
+        act_fwd10 = QAction("Step Forward 10s\tRight", self)
         act_fwd10.triggered.connect(lambda: self.seek_relative(10))
         playback_menu.addAction(act_fwd10)
+        act_frame_back = QAction("Previous Frame\t,", self)
+        act_frame_back.triggered.connect(self._frame_step_back)
+        playback_menu.addAction(act_frame_back)
+        act_frame_fwd = QAction("Next Frame\t.", self)
+        act_frame_fwd.triggered.connect(self._frame_step_forward)
+        playback_menu.addAction(act_frame_fwd)
 
         view_menu = bar.addMenu("&View")
         # F11 is a global QShortcut so it works in fullscreen too; we keep
@@ -826,10 +852,40 @@ class PlayerWindow(QMainWindow):
         add("F11", self._fullscreen_button_pressed)
         add("Escape", self._exit_fullscreen)
         add("M", self.toggle_mute)
+        add("Left", lambda: self.seek_relative(-10))
+        add("Right", lambda: self.seek_relative(10))
+        add("Shift+Left", lambda: self.seek_relative(-1))
+        add("Shift+Right", lambda: self.seek_relative(1))
+        add("Up", lambda: self._nudge_volume(+5))
+        add("Down", lambda: self._nudge_volume(-5))
+        add(",", self._frame_step_back)
+        add(".", self._frame_step_forward)
 
     def _exit_fullscreen(self) -> None:
         if self.isFullScreen():
             self.toggle_fullscreen(False)
+
+    def _nudge_volume(self, delta: int) -> None:
+        new = max(0, min(100, int(self._volume) + delta))
+        self.set_volume(new)
+
+    def _frame_step_forward(self) -> None:
+        if not self._current_file:
+            return
+        try:
+            self.player.command("frame-step")
+            self._show_osd("frame +1")
+        except Exception:
+            pass
+
+    def _frame_step_back(self) -> None:
+        if not self._current_file:
+            return
+        try:
+            self.player.command("frame-back-step")
+            self._show_osd("frame -1")
+        except Exception:
+            pass
 
     # ── Public actions (called from menus / drag-drop) ───────────────────────
     def open_file_dialog(self) -> None:
