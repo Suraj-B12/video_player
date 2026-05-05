@@ -97,6 +97,26 @@ COLOR_PRESETS = [
 VO_FALLBACK_CHAIN = "gpu-next,gpu,direct3d"
 
 
+def _to_plain_dict(value) -> dict:
+    """mpv often hands back MpvNode/list-of-pairs structures. Coerce to a
+    plain dict so Qt signals can carry a stable type."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return {str(k): v for k, v in value.items()}
+    try:
+        return {str(k): v for k, v in value}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _fmt_seconds(seconds: float | int | None) -> str:
+    s = int(seconds or 0)
+    h, m = divmod(s, 3600)
+    m, s = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
 # ─── Bridge: mpv thread → Qt main thread ─────────────────────────────────────
 class MpvBridge(QObject):
     """python-mpv fires events on its own thread. Qt UI calls must happen on
@@ -104,6 +124,16 @@ class MpvBridge(QObject):
     file_loaded = Signal()
     end_file = Signal(str)              # reason
     error_message = Signal(str)         # human-readable error
+
+    # property changes
+    time_pos_changed = Signal(float)
+    duration_changed = Signal(float)
+    pause_changed = Signal(bool)
+    volume_changed = Signal(int)
+    mute_changed = Signal(bool)
+    video_params_changed = Signal(dict)
+    audio_params_changed = Signal(dict)
+    metadata_changed = Signal(dict)
 
 
 # ─── Main window ─────────────────────────────────────────────────────────────
@@ -121,6 +151,16 @@ class PlayerWindow(QMainWindow):
         self._current_lut: Path | None = None
         self._target_prim: str = "auto"
         self._hwdec_enabled: bool = True
+
+        # Cached property state (kept up-to-date by bridge signals).
+        self._duration: float = 0.0
+        self._time_pos: float = 0.0
+        self._paused: bool = False
+        self._volume: int = 100
+        self._muted: bool = False
+        self._video_params: dict = {}
+        self._audio_params: dict = {}
+        self._metadata: dict = {}
 
         self._build_video_surface()
         self._build_status_bar()
@@ -159,11 +199,16 @@ class PlayerWindow(QMainWindow):
                 # Output chain — falls back gracefully if no GPU/GL.
                 vo=VO_FALLBACK_CHAIN,
                 ao="auto",
+                audio_device="auto",
+                volume=100,
+                mute=False,
 
-                # On-screen controls (the VLC-like overlay on hover).
-                osc=True,
+                # OSD on (we do our own controls, but keep mpv's text overlay
+                # for show-text feedback).
+                osd_level=1,
                 osd_bar=True,
                 osd_on_seek="msg-bar",
+                osd_font_size=36,
 
                 # Keyboard works inside the video window.
                 input_default_bindings=True,
@@ -206,6 +251,48 @@ class PlayerWindow(QMainWindow):
         # mpv-thread → bridge signals.
         self.player.event_callback("file-loaded")(self._mpv_file_loaded)
         self.player.event_callback("end-file")(self._mpv_end_file)
+
+        # Property observers — Qt thread reads stay current.
+        self._wire_property_observers()
+
+    def _wire_property_observers(self) -> None:
+        # Each observer fires on the mpv worker thread; we just emit a Qt
+        # signal so the main thread can act on it.
+
+        @self.player.property_observer("time-pos")
+        def _time_pos(_name, value):
+            self.bridge.time_pos_changed.emit(float(value or 0.0))
+
+        @self.player.property_observer("duration")
+        def _dur(_name, value):
+            self.bridge.duration_changed.emit(float(value or 0.0))
+
+        @self.player.property_observer("pause")
+        def _pause(_name, value):
+            self.bridge.pause_changed.emit(bool(value))
+
+        @self.player.property_observer("volume")
+        def _vol(_name, value):
+            try:
+                self.bridge.volume_changed.emit(int(value or 0))
+            except (TypeError, ValueError):
+                pass
+
+        @self.player.property_observer("mute")
+        def _mute(_name, value):
+            self.bridge.mute_changed.emit(bool(value))
+
+        @self.player.property_observer("video-params")
+        def _vparams(_name, value):
+            self.bridge.video_params_changed.emit(_to_plain_dict(value))
+
+        @self.player.property_observer("audio-params")
+        def _aparams(_name, value):
+            self.bridge.audio_params_changed.emit(_to_plain_dict(value))
+
+        @self.player.property_observer("metadata")
+        def _meta(_name, value):
+            self.bridge.metadata_changed.emit(_to_plain_dict(value))
 
     def _build_menus(self) -> None:
         bar = self.menuBar()
@@ -281,6 +368,14 @@ class PlayerWindow(QMainWindow):
         self.bridge.file_loaded.connect(self._handle_file_loaded)
         self.bridge.end_file.connect(self._handle_end_file)
         self.bridge.error_message.connect(self._handle_error)
+        self.bridge.time_pos_changed.connect(self._set_time_pos)
+        self.bridge.duration_changed.connect(self._set_duration)
+        self.bridge.pause_changed.connect(self._set_paused)
+        self.bridge.volume_changed.connect(self._set_volume)
+        self.bridge.mute_changed.connect(self._set_muted)
+        self.bridge.video_params_changed.connect(self._set_video_params)
+        self.bridge.audio_params_changed.connect(self._set_audio_params)
+        self.bridge.metadata_changed.connect(self._set_metadata)
 
     # ── Public actions (called from menus / drag-drop) ───────────────────────
     def open_file_dialog(self) -> None:
@@ -438,6 +533,33 @@ class PlayerWindow(QMainWindow):
     def _handle_error(self, message: str) -> None:
         self.status.showMessage(message, 6000)
 
+    def _set_time_pos(self, value: float) -> None:
+        self._time_pos = value
+
+    def _set_duration(self, value: float) -> None:
+        self._duration = value
+        self._update_status()
+
+    def _set_paused(self, value: bool) -> None:
+        self._paused = value
+
+    def _set_volume(self, value: int) -> None:
+        self._volume = value
+
+    def _set_muted(self, value: bool) -> None:
+        self._muted = value
+
+    def _set_video_params(self, params: dict) -> None:
+        self._video_params = params or {}
+        self._update_status()
+
+    def _set_audio_params(self, params: dict) -> None:
+        self._audio_params = params or {}
+        self._update_status()
+
+    def _set_metadata(self, meta: dict) -> None:
+        self._metadata = meta or {}
+
     def _show_error(self, message: str) -> None:
         # Visible-but-not-modal error: status bar + console log.
         sys.stderr.write(f"[error] {message}\n")
@@ -446,20 +568,26 @@ class PlayerWindow(QMainWindow):
     def _update_status(self) -> None:
         if not self._current_file:
             return
+        # Pull from cached observer state (no main-thread reads of mpv props).
+        vp = self._video_params
+        w = vp.get("w") or vp.get("dw")
+        h = vp.get("h") or vp.get("dh")
+        # video-codec / hwdec-current aren't observed yet; safe to read once
+        # since they don't change during steady-state playback.
         try:
-            w = self.player.width
-            h = self.player.height
             codec = self.player.video_codec or "?"
-            hwdec = self.player.hwdec_current or "no"
-            dur = self.player.duration
-            dur_str = f"{int(dur // 60)}:{int(dur % 60):02d}" if dur else "?"
-            res = f"{w}×{h}" if w and h else "?"
-            self.status.showMessage(
-                f"{self._current_file.name}   |   {res}   |   {codec}   |   "
-                f"hwdec: {hwdec}   |   {dur_str}"
-            )
         except Exception:
-            pass
+            codec = "?"
+        try:
+            hwdec = self.player.hwdec_current or "no"
+        except Exception:
+            hwdec = "?"
+        res = f"{w}x{h}" if w and h else "?"
+        dur_str = _fmt_seconds(self._duration) if self._duration else "?"
+        self.status.showMessage(
+            f"{self._current_file.name}   |   {res}   |   {codec}   |   "
+            f"hwdec: {hwdec}   |   {dur_str}"
+        )
 
     # ── Drag-and-drop ────────────────────────────────────────────────────────
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802 (Qt API)
