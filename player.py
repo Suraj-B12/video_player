@@ -85,6 +85,16 @@ except OSError as e:
 except ImportError as e:
     _bail(f"python-mpv not installed:\n\n{e}\n\nRun: pip install python-mpv")
 
+# ─── Optional companion modules (LUT mgmt, Clip Inspector) ───────────────────
+# These live in playerlib/ so the main file stays manageable as features grow.
+try:
+    from playerlib import luts as _luts_mod
+    from playerlib.inspector import ClipInspectorDialog
+except ImportError as e:
+    sys.stderr.write(f"[warn] playerlib not importable: {e}\n")
+    _luts_mod = None
+    ClipInspectorDialog = None  # type: ignore
+
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 VIDEO_EXTS = {
@@ -568,7 +578,9 @@ class PlayerWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self._current_file: Path | None = None
-        self._current_lut: Path | None = None
+        self._current_lut: Path | None = None        # legacy single-slot
+        self._cst_lut: Path | None = None            # color-space transform
+        self._look_lut: Path | None = None           # creative look
         self._target_prim: str = "auto"
         self._hwdec_enabled: bool = True
 
@@ -785,6 +797,9 @@ class PlayerWindow(QMainWindow):
         act_props = QAction("Properties...", self, shortcut="Ctrl+I")
         act_props.triggered.connect(self.show_properties)
         view_menu.addAction(act_props)
+        act_inspector = QAction("Clip Inspector...", self, shortcut="Ctrl+M")
+        act_inspector.triggered.connect(self.show_clip_inspector)
+        view_menu.addAction(act_inspector)
 
         settings_menu = bar.addMenu("&Settings")
 
@@ -800,14 +815,23 @@ class PlayerWindow(QMainWindow):
             self._color_action_group.addAction(act)
             color_menu.addAction(act)
 
-        # — LUT loader —
-        lut_menu: QMenu = settings_menu.addMenu("LUT")
-        act_load_lut = QAction("Load .cube LUT...", self)
-        act_load_lut.triggered.connect(self.load_lut_dialog)
-        lut_menu.addAction(act_load_lut)
-        act_clear_lut = QAction("Clear LUT", self)
-        act_clear_lut.triggered.connect(self.clear_lut)
-        lut_menu.addAction(act_clear_lut)
+        # — Color Space Transform (S-Log3 → Rec.709 etc.) —
+        self._cst_menu = settings_menu.addMenu("Color Space Transform")
+        self._cst_action_group = QActionGroup(self)
+        self._cst_action_group.setExclusive(True)
+        # — Look LUT (cinematic film emulations + user .cube files) —
+        self._look_menu = settings_menu.addMenu("Look LUT")
+        self._look_action_group = QActionGroup(self)
+        self._look_action_group.setExclusive(True)
+        self._populate_lut_menus()
+
+        settings_menu.addSeparator()
+        act_load_custom = QAction("Load Custom .cube as Look...", self)
+        act_load_custom.triggered.connect(self.load_lut_dialog)
+        settings_menu.addAction(act_load_custom)
+        act_clear_all_luts = QAction("Clear All LUTs", self)
+        act_clear_all_luts.triggered.connect(self.clear_all_luts)
+        settings_menu.addAction(act_clear_all_luts)
 
         # — Hardware decoding toggle —
         settings_menu.addSeparator()
@@ -996,35 +1020,134 @@ class PlayerWindow(QMainWindow):
         except Exception as e:
             self._show_error(f"Failed to set target primaries: {e}")
 
+    def _populate_lut_menus(self) -> None:
+        """Discover LUT files in luts/{conversions,cinematic,user} and wire
+        them into the two action groups. Called at construction; should be
+        called again if LUTs are added at runtime."""
+        if _luts_mod is None:
+            return
+
+        # Helper to add a "None" radio item.
+        def add_none(menu: QMenu, group: QActionGroup, on_select) -> None:
+            act = QAction("None", self, checkable=True)
+            act.setChecked(True)
+            act.triggered.connect(lambda _checked, p=None: on_select(p))
+            group.addAction(act)
+            menu.addAction(act)
+
+        # Helper to add a LUT radio item.
+        def add_lut(menu: QMenu, group: QActionGroup, lut, on_select) -> None:
+            act = QAction(lut.name, self, checkable=True)
+            act.triggered.connect(lambda _checked, p=lut.path: on_select(p))
+            group.addAction(act)
+            menu.addAction(act)
+
+        catalog = _luts_mod.discover()
+
+        # ── CST menu ──
+        self._cst_menu.clear()
+        for a in self._cst_action_group.actions():
+            self._cst_action_group.removeAction(a)
+        add_none(self._cst_menu, self._cst_action_group, self.apply_cst)
+        if catalog["conversions"]:
+            self._cst_menu.addSeparator()
+            for lut in catalog["conversions"]:
+                add_lut(self._cst_menu, self._cst_action_group, lut, self.apply_cst)
+        else:
+            no_data = QAction("(no conversion LUTs found — run lut_generator)", self)
+            no_data.setEnabled(False)
+            self._cst_menu.addAction(no_data)
+
+        # ── Look menu ──
+        self._look_menu.clear()
+        for a in self._look_action_group.actions():
+            self._look_action_group.removeAction(a)
+        add_none(self._look_menu, self._look_action_group, self.apply_look)
+        if catalog["cinematic"]:
+            self._look_menu.addSeparator()
+            cinematic_label = QAction("Film Emulation", self)
+            cinematic_label.setEnabled(False)
+            self._look_menu.addAction(cinematic_label)
+            for lut in catalog["cinematic"]:
+                add_lut(self._look_menu, self._look_action_group, lut, self.apply_look)
+        if catalog["user"]:
+            self._look_menu.addSeparator()
+            user_label = QAction("User LUTs", self)
+            user_label.setEnabled(False)
+            self._look_menu.addAction(user_label)
+            for lut in catalog["user"]:
+                add_lut(self._look_menu, self._look_action_group, lut, self.apply_look)
+
     def load_lut_dialog(self) -> None:
+        """Open a file dialog to load any .cube — applied as a Look LUT."""
         path_str, _ = QFileDialog.getOpenFileName(
             self,
-            "Load .cube LUT",
+            "Load Look LUT",
             str(Path.home()),
             f"LUT files ({' '.join('*' + e for e in sorted(LUT_EXTS))});;All files (*.*)",
         )
         if path_str:
-            self.apply_lut(Path(path_str))
+            self.apply_look(Path(path_str))
 
-    def apply_lut(self, path: Path) -> None:
-        if not path.is_file():
+    def apply_cst(self, path: Path | None) -> None:
+        """Set the Color Space Transform slot. None clears it."""
+        if path is not None and not path.is_file():
             self._show_error(f"LUT not found: {path}")
             return
-        try:
-            self.player["lut"] = str(path)
-            self.player["lut-type"] = "conversion"
-            self._current_lut = path
-            self.status.showMessage(f"LUT applied: {path.name}", 4000)
-        except Exception as e:
-            self._show_error(f"Failed to apply LUT: {e}")
+        self._cst_lut = path
+        self._refresh_lut_chain()
+        if path:
+            self._show_osd(f"CST: {path.stem}")
+            self.status.showMessage(f"CST applied: {path.name}", 4000)
+        else:
+            self._show_osd("CST cleared")
+            self.status.showMessage("CST cleared", 3000)
 
-    def clear_lut(self) -> None:
+    def apply_look(self, path: Path | None) -> None:
+        """Set the Look LUT slot. None clears it."""
+        if path is not None and not path.is_file():
+            self._show_error(f"LUT not found: {path}")
+            return
+        self._look_lut = path
+        self._refresh_lut_chain()
+        if path:
+            self._show_osd(f"Look: {path.stem}")
+            self.status.showMessage(f"Look applied: {path.name}", 4000)
+        else:
+            self._show_osd("Look cleared")
+            self.status.showMessage("Look cleared", 3000)
+
+    def clear_all_luts(self) -> None:
+        self._cst_lut = None
+        self._look_lut = None
+        self._refresh_lut_chain()
+        # Re-tick the "None" radio in each group.
+        for grp in (self._cst_action_group, self._look_action_group):
+            for act in grp.actions():
+                if act.text() == "None":
+                    act.setChecked(True)
+                    break
+        self._show_osd("All LUTs cleared")
+        self.status.showMessage("All LUTs cleared", 3000)
+
+    def _refresh_lut_chain(self) -> None:
+        if _luts_mod is None:
+            return
         try:
-            self.player["lut"] = ""
-            self._current_lut = None
-            self.status.showMessage("LUT cleared", 3000)
+            _luts_mod.apply_to(self.player, cst=self._cst_lut, look=self._look_lut)
         except Exception as e:
-            self._show_error(f"Failed to clear LUT: {e}")
+            self._show_error(f"Failed to apply LUT chain: {e}")
+
+    def show_clip_inspector(self) -> None:
+        if not self._current_file:
+            self.status.showMessage("No file loaded.", 3000)
+            return
+        if ClipInspectorDialog is None:
+            QMessageBox.warning(self, "Clip Inspector",
+                                "playerlib.inspector module is not available.")
+            return
+        dlg = ClipInspectorDialog(self, self._current_file)
+        dlg.exec()
 
     def toggle_hwdec(self, checked: bool) -> None:
         self._hwdec_enabled = checked
