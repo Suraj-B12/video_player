@@ -55,7 +55,7 @@ _prepare_libmpv()
 
 # ─── Imports that depend on libmpv/Qt being ready ────────────────────────────
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QUrl
-from PySide6.QtGui import QAction, QActionGroup, QDragEnterEvent, QDropEvent, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QDragEnterEvent, QDropEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -376,9 +376,11 @@ QTextBrowser {
 
 
 class PropertiesDialog(QDialog):
-    """Read-only file/codec/metadata view, populated from libmpv properties."""
+    """Read-only file/codec/metadata view. Reads fresh values from libmpv,
+    falling back to the parent window's observer cache when a fresh read
+    returns nothing (which can happen briefly right after a file loads)."""
 
-    def __init__(self, parent: QWidget, player: "mpv.MPV") -> None:
+    def __init__(self, parent: "PlayerWindow", player: "mpv.MPV") -> None:
         super().__init__(parent)
         self.setWindowTitle("File Properties")
         self.resize(620, 560)
@@ -396,7 +398,7 @@ class PropertiesDialog(QDialog):
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)
 
-        self.text.setHtml(self._build_html(player))
+        self.text.setHtml(self._build_html(parent, player))
 
     @staticmethod
     def _safe_get(player: "mpv.MPV", prop: str, default=None):
@@ -406,11 +408,11 @@ class PropertiesDialog(QDialog):
         except Exception:
             return default
 
-    def _build_html(self, p: "mpv.MPV") -> str:
-        path = self._safe_get(p, "path", "(no file)")
+    def _build_html(self, owner: "PlayerWindow", p: "mpv.MPV") -> str:
+        path = self._safe_get(p, "path") or (str(owner._current_file) if owner._current_file else "(no file)")
         fmt = self._safe_get(p, "file-format", "?")
         size = self._safe_get(p, "file-size")
-        dur = self._safe_get(p, "duration")
+        dur = self._safe_get(p, "duration") or owner._duration
         v_codec_friendly = self._safe_get(p, "video-codec", "")
         v_codec_id = self._safe_get(p, "video-format", "")
         a_codec_friendly = self._safe_get(p, "audio-codec", "")
@@ -418,9 +420,19 @@ class PropertiesDialog(QDialog):
         hwdec = self._safe_get(p, "hwdec-current", "no") or "no"
         fps = self._safe_get(p, "container-fps") or self._safe_get(p, "estimated-vf-fps")
 
-        vp = _to_plain_dict(self._safe_get(p, "video-params"))
-        ap = _to_plain_dict(self._safe_get(p, "audio-params"))
-        md = _to_plain_dict(self._safe_get(p, "metadata"))
+        # Prefer cached observer state; fall back to fresh read.
+        vp = owner._video_params or _to_plain_dict(self._safe_get(p, "video-params"))
+        ap = owner._audio_params or _to_plain_dict(self._safe_get(p, "audio-params"))
+        md = owner._metadata or _to_plain_dict(self._safe_get(p, "metadata"))
+
+        # One-line debug dump so we can see what mpv really gave us when the
+        # dialog looks empty.
+        sys.stderr.write(
+            f"[props] codec_friendly={v_codec_friendly!r} codec_id={v_codec_id!r} "
+            f"acodec={a_codec_friendly!r} fmt={fmt!r} fps={fps!r} hwdec={hwdec!r}\n"
+            f"[props] video_params keys={list(vp.keys())[:8]}\n"
+            f"[props] metadata keys={list(md.keys())[:8]}\n"
+        )
 
         rows: list[str] = []
         rows.append(
@@ -609,8 +621,11 @@ class PlayerWindow(QMainWindow):
 
                 # Output chain — falls back gracefully if no GPU/GL.
                 vo=VO_FALLBACK_CHAIN,
-                ao="auto",
-                audio_device="auto",
+                # WASAPI is the native Windows audio backend. We list explicit
+                # fallbacks too because `auto` was failing silently in this
+                # embedded setup. wasapi,openal,sdl gives us redundancy.
+                ao="wasapi,openal,sdl",
+                audio_fallback_to_null=False,
                 volume=100,
                 mute=False,
 
@@ -735,7 +750,9 @@ class PlayerWindow(QMainWindow):
         playback_menu.addAction(act_fwd10)
 
         view_menu = bar.addMenu("&View")
-        act_full = QAction("Fullscreen", self, shortcut="F11", checkable=True)
+        # F11 is a global QShortcut so it works in fullscreen too; we keep
+        # the label hint here so the menu is self-documenting.
+        act_full = QAction("Fullscreen\tF11", self, checkable=True)
         act_full.triggered.connect(self.toggle_fullscreen)
         view_menu.addAction(act_full)
         self.act_full = act_full
@@ -792,6 +809,27 @@ class PlayerWindow(QMainWindow):
         self.bridge.video_params_changed.connect(self._set_video_params)
         self.bridge.audio_params_changed.connect(self._set_audio_params)
         self.bridge.metadata_changed.connect(self._set_metadata)
+        self._install_global_shortcuts()
+
+    def _install_global_shortcuts(self) -> None:
+        """Application-context shortcuts so keys work regardless of which
+        widget has focus (transport bar, menu, video frame all coexist)."""
+        def add(seq: str, slot) -> None:
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.setContext(Qt.ApplicationShortcut)
+            sc.activated.connect(slot)
+
+        # Keys that have to work in fullscreen (when the menu is hidden) and
+        # regardless of which child widget holds focus. Menu-based Ctrl+O,
+        # Ctrl+I, Ctrl+Q work fine while the menu is visible.
+        add("Space", self.toggle_pause)
+        add("F11", self._fullscreen_button_pressed)
+        add("Escape", self._exit_fullscreen)
+        add("M", self.toggle_mute)
+
+    def _exit_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.toggle_fullscreen(False)
 
     # ── Public actions (called from menus / drag-drop) ───────────────────────
     def open_file_dialog(self) -> None:
@@ -986,15 +1024,41 @@ class PlayerWindow(QMainWindow):
         self.bridge.end_file.emit(reason)
 
     def _on_mpv_log(self, level: str, component: str, message: str) -> None:
-        # Runs on mpv thread. Forward errors only — info/debug would flood.
-        if level in ("error", "fatal"):
+        # Runs on mpv thread. Forward warnings + errors — info/debug would flood.
+        if level in ("warn", "error", "fatal"):
             self.bridge.error_message.emit(f"[{component}] {message.strip()}")
 
     # ── Qt main-thread handlers ──────────────────────────────────────────────
     def _handle_file_loaded(self) -> None:
         self._update_status()
         title = self._current_file.name if self._current_file else self.APP_TITLE
-        self.setWindowTitle(f"{title} — {self.APP_TITLE}")
+        self.setWindowTitle(f"{title} - {self.APP_TITLE}")
+        # One-shot diagnostic to console: confirm audio backend actually started.
+        QTimer.singleShot(800, self._log_audio_state)
+        # Properties dialog observers may not have fired yet — give them time
+        # by re-running update_status once more after a short delay.
+        QTimer.singleShot(800, self._update_status)
+
+    def _log_audio_state(self) -> None:
+        try:
+            ao = self.player.current_ao
+        except Exception:
+            ao = "?"
+        try:
+            vol = self.player.volume
+        except Exception:
+            vol = "?"
+        try:
+            muted = self.player.mute
+        except Exception:
+            muted = "?"
+        try:
+            ac = self.player.audio_codec
+        except Exception:
+            ac = "?"
+        sys.stderr.write(
+            f"[audio] ao={ao!r} volume={vol} muted={muted} audio_codec={ac!r}\n"
+        )
 
     def _handle_end_file(self, reason: str) -> None:
         # Reasons: eof (normal), stop (user), quit, error, redirect, unknown
