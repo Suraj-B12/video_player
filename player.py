@@ -58,6 +58,8 @@ from PySide6.QtCore import Qt, QObject, Signal, QTimer, QUrl
 from PySide6.QtGui import QAction, QActionGroup, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -70,6 +72,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QStatusBar,
     QStyle,
+    QTextBrowser,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -124,6 +127,43 @@ def _fmt_seconds(seconds: float | int | None) -> str:
     h, m = divmod(s, 3600)
     m, s = divmod(m, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _fmt_size(num_bytes: int | float | None) -> str:
+    if not num_bytes:
+        return "?"
+    n = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _decode_pixfmt(pixfmt: str) -> str:
+    """Turn a libav pixel format like 'yuv422p10le' into a human label."""
+    if not pixfmt:
+        return ""
+    p = pixfmt.lower()
+    bits = "8-bit"
+    if "10" in p:
+        bits = "10-bit"
+    elif "12" in p:
+        bits = "12-bit"
+    elif "16" in p:
+        bits = "16-bit"
+    chroma = ""
+    if "444" in p:
+        chroma = "4:4:4"
+    elif "422" in p:
+        chroma = "4:2:2"
+    elif "420" in p:
+        chroma = "4:2:0"
+    parts = [bits]
+    if chroma:
+        parts.append(chroma)
+    parts.append(f"({pixfmt})")
+    return " ".join(parts)
 
 
 # ─── Bridge: mpv thread → Qt main thread ─────────────────────────────────────
@@ -319,6 +359,172 @@ class TransportBar(QWidget):
             target = self._duration * self.slider.value() / 1000
             self.seek_to.emit(target)
         self._user_seeking = False
+
+
+# ─── Properties dialog ───────────────────────────────────────────────────────
+PROPERTIES_QSS = """
+QDialog { background: #1a1a1a; }
+QTextBrowser {
+    background: #111;
+    color: #e0e0e0;
+    border: 1px solid #2a2a2a;
+    border-radius: 4px;
+    padding: 8px;
+    font-size: 9.5pt;
+}
+"""
+
+
+class PropertiesDialog(QDialog):
+    """Read-only file/codec/metadata view, populated from libmpv properties."""
+
+    def __init__(self, parent: QWidget, player: "mpv.MPV") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("File Properties")
+        self.resize(620, 560)
+        self.setStyleSheet(PROPERTIES_QSS)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        self.text = QTextBrowser(self)
+        self.text.setOpenExternalLinks(False)
+        layout.addWidget(self.text, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+        self.text.setHtml(self._build_html(player))
+
+    @staticmethod
+    def _safe_get(player: "mpv.MPV", prop: str, default=None):
+        try:
+            v = player[prop]
+            return v if v is not None else default
+        except Exception:
+            return default
+
+    def _build_html(self, p: "mpv.MPV") -> str:
+        path = self._safe_get(p, "path", "(no file)")
+        fmt = self._safe_get(p, "file-format", "?")
+        size = self._safe_get(p, "file-size")
+        dur = self._safe_get(p, "duration")
+        v_codec_friendly = self._safe_get(p, "video-codec", "")
+        v_codec_id = self._safe_get(p, "video-format", "")
+        a_codec_friendly = self._safe_get(p, "audio-codec", "")
+        a_codec_id = self._safe_get(p, "audio-codec-name", "")
+        hwdec = self._safe_get(p, "hwdec-current", "no") or "no"
+        fps = self._safe_get(p, "container-fps") or self._safe_get(p, "estimated-vf-fps")
+
+        vp = _to_plain_dict(self._safe_get(p, "video-params"))
+        ap = _to_plain_dict(self._safe_get(p, "audio-params"))
+        md = _to_plain_dict(self._safe_get(p, "metadata"))
+
+        rows: list[str] = []
+        rows.append(
+            "<style>"
+            "h3 { color:#4a90e2; margin:14px 0 4px 0; font-size:11pt; "
+            "border-bottom:1px solid #2a2a2a; padding-bottom:2px; }"
+            "table { border-collapse:collapse; width:100%; margin:0; }"
+            "td { padding:3px 8px; vertical-align:top; }"
+            "td.k { color:#888; width:35%; }"
+            "td.v { color:#e8e8e8; font-family:Consolas,monospace; }"
+            "</style>"
+        )
+
+        def section(title: str) -> None:
+            rows.append(f"<h3>{title}</h3><table>")
+
+        def row(k: str, v) -> None:
+            if v in (None, "", "?"):
+                return
+            rows.append(f'<tr><td class="k">{k}</td><td class="v">{v}</td></tr>')
+
+        def end_section() -> None:
+            rows.append("</table>")
+
+        # File
+        section("File")
+        row("Path", path)
+        row("Container", fmt)
+        row("Size", _fmt_size(size) if size else None)
+        row("Duration", _fmt_seconds(dur) if dur else None)
+        end_section()
+
+        # Video
+        section("Video")
+        if v_codec_friendly and v_codec_id and v_codec_friendly != v_codec_id:
+            row("Codec", f"{v_codec_friendly}  ({v_codec_id})")
+        else:
+            row("Codec", v_codec_friendly or v_codec_id)
+        if vp:
+            w = vp.get("w") or vp.get("dw")
+            h = vp.get("h") or vp.get("dh")
+            if w and h:
+                row("Resolution", f"{w}x{h}")
+            pixfmt = vp.get("pixelformat") or vp.get("hw-pixelformat")
+            if pixfmt:
+                row("Pixel format", _decode_pixfmt(pixfmt))
+            row("Color matrix", vp.get("colormatrix"))
+            row("Primaries", vp.get("primaries"))
+            row("Transfer (gamma)", vp.get("gamma"))
+            row("Range", vp.get("colorlevels"))
+            row("Chroma siting", vp.get("chroma-location"))
+            sig_peak = vp.get("sig-peak")
+            if sig_peak:
+                row("Signal peak", f"{sig_peak}")
+        if fps:
+            try:
+                row("Frame rate", f"{float(fps):.3f} fps")
+            except (TypeError, ValueError):
+                row("Frame rate", str(fps))
+        row("Hardware decode", hwdec)
+        end_section()
+
+        # Audio
+        if a_codec_friendly or a_codec_id:
+            section("Audio")
+            if a_codec_friendly and a_codec_id and a_codec_friendly != a_codec_id:
+                row("Codec", f"{a_codec_friendly}  ({a_codec_id})")
+            else:
+                row("Codec", a_codec_friendly or a_codec_id)
+            if ap:
+                if ap.get("samplerate"):
+                    row("Sample rate", f"{ap['samplerate']} Hz")
+                ch = ap.get("channel-count") or ap.get("channels")
+                if ch:
+                    row("Channels", ch)
+                if ap.get("format"):
+                    row("Sample format", ap["format"])
+            end_section()
+
+        # Container metadata (Sony cameras embed model, lens, ISO, etc.)
+        if md:
+            section("Metadata")
+            # Surface common camera tags first.
+            preferred = ("make", "model", "encoder", "creation_time",
+                        "com.android.version", "com.apple.quicktime.make",
+                        "com.apple.quicktime.model", "com.apple.quicktime.creationdate")
+            seen: set[str] = set()
+            for key in preferred:
+                if key in md:
+                    row(key, md[key])
+                    seen.add(key)
+            for k in sorted(md):
+                if k in seen:
+                    continue
+                v = md[k]
+                if v is None or v == "":
+                    continue
+                s = str(v)
+                if len(s) > 200:
+                    s = s[:200] + "…"
+                row(k, s)
+            end_section()
+
+        return "".join(rows)
 
 
 # ─── Main window ─────────────────────────────────────────────────────────────
@@ -533,6 +739,9 @@ class PlayerWindow(QMainWindow):
         act_full.triggered.connect(self.toggle_fullscreen)
         view_menu.addAction(act_full)
         self.act_full = act_full
+        act_props = QAction("Properties...", self, shortcut="Ctrl+I")
+        act_props.triggered.connect(self.show_properties)
+        view_menu.addAction(act_props)
 
         settings_menu = bar.addMenu("&Settings")
 
@@ -733,6 +942,13 @@ class PlayerWindow(QMainWindow):
             )
         except Exception as e:
             self._show_error(f"Failed to set hwdec: {e}")
+
+    def show_properties(self) -> None:
+        if not self._current_file:
+            self.status.showMessage("No file loaded.", 3000)
+            return
+        dlg = PropertiesDialog(self, self.player)
+        dlg.exec()
 
     def show_about(self) -> None:
         try:
