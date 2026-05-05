@@ -60,10 +60,19 @@ from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QFrame,
+    QHBoxLayout,
+    QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QSlider,
     QStatusBar,
+    QStyle,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
 )
 
 try:
@@ -136,6 +145,182 @@ class MpvBridge(QObject):
     metadata_changed = Signal(dict)
 
 
+# ─── Transport bar ───────────────────────────────────────────────────────────
+TRANSPORT_QSS = """
+QWidget#transportBar {
+    background: #181818;
+    color: #e0e0e0;
+    border-top: 1px solid #2a2a2a;
+}
+QWidget#transportBar QToolButton {
+    background: transparent;
+    border: none;
+    padding: 6px;
+    color: #e0e0e0;
+}
+QWidget#transportBar QToolButton:hover {
+    background: #2a2a2a;
+    border-radius: 4px;
+}
+QWidget#transportBar QToolButton:pressed {
+    background: #333;
+}
+QWidget#transportBar QLabel {
+    color: #b0b0b0;
+    font-family: 'Consolas', 'Cascadia Mono', monospace;
+    font-size: 9pt;
+    min-width: 56px;
+}
+QWidget#transportBar QSlider::groove:horizontal {
+    height: 4px;
+    background: #333;
+    border-radius: 2px;
+}
+QWidget#transportBar QSlider::sub-page:horizontal {
+    background: #4a90e2;
+    border-radius: 2px;
+}
+QWidget#transportBar QSlider::add-page:horizontal {
+    background: #333;
+    border-radius: 2px;
+}
+QWidget#transportBar QSlider::handle:horizontal {
+    background: #f0f0f0;
+    width: 12px;
+    height: 12px;
+    margin: -5px 0;
+    border-radius: 6px;
+}
+QWidget#transportBar QSlider::handle:horizontal:hover {
+    background: #fff;
+}
+QWidget#transportBar QSlider#volumeSlider {
+    max-width: 90px;
+}
+"""
+
+
+class TransportBar(QWidget):
+    """Bottom playback controls — play/pause, seek, time, volume, fullscreen."""
+
+    play_pause_clicked = Signal()
+    seek_to = Signal(float)              # absolute seconds
+    volume_set = Signal(int)             # 0-100
+    mute_toggled = Signal()
+    fullscreen_toggled = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("transportBar")
+        self.setStyleSheet(TRANSPORT_QSS)
+        self.setFixedHeight(52)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self._duration: float = 0.0
+        self._user_seeking: bool = False
+
+        style = self.style()
+        ic_play = style.standardIcon(QStyle.SP_MediaPlay)
+        ic_volume = style.standardIcon(QStyle.SP_MediaVolume)
+        ic_full = style.standardIcon(QStyle.SP_TitleBarMaxButton)
+
+        self.btn_play = QToolButton()
+        self.btn_play.setIcon(ic_play)
+        self.btn_play.setIconSize(self.btn_play.iconSize() * 1.2)
+        self.btn_play.setToolTip("Play / Pause (Space)")
+        self.btn_play.clicked.connect(self.play_pause_clicked.emit)
+        self._icon_play = ic_play
+        self._icon_pause = style.standardIcon(QStyle.SP_MediaPause)
+
+        self.lbl_pos = QLabel("0:00")
+        self.lbl_pos.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 1000)
+        self.slider.setSingleStep(5)
+        self.slider.setPageStep(50)
+        self.slider.setEnabled(False)
+        self.slider.sliderPressed.connect(self._slider_pressed)
+        self.slider.sliderReleased.connect(self._slider_released)
+        self.slider.sliderMoved.connect(self._slider_moved)
+
+        self.lbl_dur = QLabel("0:00")
+        self.lbl_dur.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        self.btn_mute = QToolButton()
+        self.btn_mute.setIcon(ic_volume)
+        self.btn_mute.setToolTip("Mute (M)")
+        self.btn_mute.clicked.connect(self.mute_toggled.emit)
+        self._icon_volume = ic_volume
+        self._icon_muted = style.standardIcon(QStyle.SP_MediaVolumeMuted)
+
+        self.vol_slider = QSlider(Qt.Horizontal)
+        self.vol_slider.setObjectName("volumeSlider")
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(100)
+        self.vol_slider.valueChanged.connect(self.volume_set.emit)
+
+        self.btn_full = QToolButton()
+        self.btn_full.setIcon(ic_full)
+        self.btn_full.setToolTip("Fullscreen (F11)")
+        self.btn_full.clicked.connect(self.fullscreen_toggled.emit)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(8)
+        layout.addWidget(self.btn_play)
+        layout.addWidget(self.lbl_pos)
+        layout.addWidget(self.slider, 1)
+        layout.addWidget(self.lbl_dur)
+        layout.addSpacing(6)
+        layout.addWidget(self.btn_mute)
+        layout.addWidget(self.vol_slider)
+        layout.addSpacing(2)
+        layout.addWidget(self.btn_full)
+
+    # ── slot updates from main window ────────────────────────────────────────
+    def set_position(self, seconds: float) -> None:
+        if self._user_seeking or self._duration <= 0:
+            self.lbl_pos.setText(_fmt_seconds(seconds))
+            return
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(seconds / self._duration * 1000))
+        self.slider.blockSignals(False)
+        self.lbl_pos.setText(_fmt_seconds(seconds))
+
+    def set_duration(self, seconds: float) -> None:
+        self._duration = max(seconds, 0.0)
+        self.slider.setEnabled(self._duration > 0)
+        self.lbl_dur.setText(_fmt_seconds(seconds))
+
+    def set_paused(self, paused: bool) -> None:
+        self.btn_play.setIcon(self._icon_play if paused else self._icon_pause)
+
+    def set_volume(self, vol: int) -> None:
+        self.vol_slider.blockSignals(True)
+        self.vol_slider.setValue(max(0, min(100, vol)))
+        self.vol_slider.blockSignals(False)
+
+    def set_muted(self, muted: bool) -> None:
+        self.btn_mute.setIcon(self._icon_muted if muted else self._icon_volume)
+
+    # ── slider drag handling ─────────────────────────────────────────────────
+    def _slider_pressed(self) -> None:
+        self._user_seeking = True
+
+    def _slider_moved(self, value: int) -> None:
+        # Live-update the position label while dragging so the user sees the
+        # target time before committing the seek.
+        if self._duration > 0:
+            self.lbl_pos.setText(_fmt_seconds(self._duration * value / 1000))
+
+    def _slider_released(self) -> None:
+        if self._duration > 0:
+            target = self._duration * self.slider.value() / 1000
+            self.seek_to.emit(target)
+        self._user_seeking = False
+
+
 # ─── Main window ─────────────────────────────────────────────────────────────
 class PlayerWindow(QMainWindow):
     APP_TITLE = "ffmpeg player"
@@ -172,13 +357,33 @@ class PlayerWindow(QMainWindow):
 
     # ── UI scaffolding ───────────────────────────────────────────────────────
     def _build_video_surface(self) -> None:
+        # Central widget = video on top, transport bar below.
+        central = QWidget(self)
+        central.setStyleSheet("background-color: #000;")
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
         # mpv renders into this frame's native HWND (set via wid).
-        self.video_frame = QFrame(self)
+        self.video_frame = QFrame()
         self.video_frame.setStyleSheet("background-color: #000;")
         self.video_frame.setAttribute(Qt.WA_NativeWindow, True)
         self.video_frame.setAttribute(Qt.WA_DontCreateNativeAncestors, True)
         self.video_frame.setFocusPolicy(Qt.StrongFocus)
-        self.setCentralWidget(self.video_frame)
+        self.video_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        outer.addWidget(self.video_frame, 1)
+
+        self.transport = TransportBar()
+        outer.addWidget(self.transport, 0)
+
+        # Wire transport bar -> player methods.
+        self.transport.play_pause_clicked.connect(self.toggle_pause)
+        self.transport.seek_to.connect(self.seek_absolute)
+        self.transport.volume_set.connect(self.set_volume)
+        self.transport.mute_toggled.connect(self.toggle_mute)
+        self.transport.fullscreen_toggled.connect(self._fullscreen_button_pressed)
+
+        self.setCentralWidget(central)
 
     def _build_status_bar(self) -> None:
         self.status: QStatusBar = self.statusBar()
@@ -307,7 +512,9 @@ class PlayerWindow(QMainWindow):
         file_menu.addAction(act_quit)
 
         playback_menu = bar.addMenu("&Playback")
-        act_play = QAction("Play / Pause", self, shortcut="Space")
+        # No Space shortcut here — mpv's input handler covers Space natively
+        # via the focused video frame, and a Qt accelerator would steal it.
+        act_play = QAction("Play / Pause", self)
         act_play.triggered.connect(self.toggle_pause)
         playback_menu.addAction(act_play)
         act_stop = QAction("Stop", self)
@@ -402,6 +609,9 @@ class PlayerWindow(QMainWindow):
     def toggle_pause(self) -> None:
         try:
             self.player.cycle("pause")
+            # Cached pause state lags one tick — read what we just toggled to.
+            now_paused = not self._paused
+            self._show_osd("Paused" if now_paused else "Playing")
         except Exception:
             pass
 
@@ -411,6 +621,8 @@ class PlayerWindow(QMainWindow):
             self._current_file = None
             self.setWindowTitle(self.APP_TITLE)
             self.status.showMessage("Stopped")
+            self.transport.set_position(0)
+            self.transport.set_duration(0)
         except Exception:
             pass
 
@@ -419,14 +631,59 @@ class PlayerWindow(QMainWindow):
             return
         try:
             self.player.seek(seconds, reference="relative", precision="exact")
+            sign = "+" if seconds >= 0 else ""
+            self._show_osd(f"{sign}{int(seconds)}s")
         except Exception:
             pass
 
-    def toggle_fullscreen(self, checked: bool) -> None:
+    def seek_absolute(self, seconds: float) -> None:
+        if not self._current_file:
+            return
+        try:
+            self.player.seek(seconds, reference="absolute", precision="exact")
+        except Exception:
+            pass
+
+    def set_volume(self, value: int) -> None:
+        try:
+            self.player["volume"] = int(value)
+            self._show_osd(f"Volume {int(value)}%")
+        except Exception:
+            pass
+
+    def toggle_mute(self) -> None:
+        try:
+            self.player.cycle("mute")
+            now_muted = not self._muted
+            self._show_osd("Muted" if now_muted else "Unmuted")
+        except Exception:
+            pass
+
+    def toggle_fullscreen(self, checked: bool | None = None) -> None:
+        if checked is None:
+            checked = not self.isFullScreen()
         if checked:
             self.showFullScreen()
+            self.transport.hide()
+            self.menuBar().hide()
+            self.statusBar().hide()
         else:
             self.showNormal()
+            self.transport.show()
+            self.menuBar().show()
+            self.statusBar().show()
+        if hasattr(self, "act_full"):
+            self.act_full.setChecked(checked)
+
+    def _fullscreen_button_pressed(self) -> None:
+        self.toggle_fullscreen(not self.isFullScreen())
+
+    def _show_osd(self, text: str, duration_ms: int = 1200) -> None:
+        # mpv's show-text uses libass; works without the bundled OSC script.
+        try:
+            self.player.command("show-text", text, duration_ms)
+        except Exception:
+            pass
 
     def set_target_prim(self, value: str) -> None:
         self._target_prim = value
@@ -535,19 +792,24 @@ class PlayerWindow(QMainWindow):
 
     def _set_time_pos(self, value: float) -> None:
         self._time_pos = value
+        self.transport.set_position(value)
 
     def _set_duration(self, value: float) -> None:
         self._duration = value
+        self.transport.set_duration(value)
         self._update_status()
 
     def _set_paused(self, value: bool) -> None:
         self._paused = value
+        self.transport.set_paused(value)
 
     def _set_volume(self, value: int) -> None:
         self._volume = value
+        self.transport.set_volume(value)
 
     def _set_muted(self, value: bool) -> None:
         self._muted = value
+        self.transport.set_muted(value)
 
     def _set_video_params(self, params: dict) -> None:
         self._video_params = params or {}
