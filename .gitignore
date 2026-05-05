@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+.claude/
+build/
+dist/
+*.spec
+
+vendor/libmpv/
+*.7z
+*.log
