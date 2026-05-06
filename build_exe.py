@@ -91,19 +91,25 @@ def build() -> None:
 
 
 def post_build_sanity() -> None:
-    exe = DIST_DIR / "DeliPlayer" / "DeliPlayer.exe"
+    bundle = DIST_DIR / "DeliPlayer"
+    exe = bundle / "DeliPlayer.exe"
     if not exe.is_file():
         sys.exit(f"Build finished but {exe} not found.")
     print(f"\nOK: {exe}  ({exe.stat().st_size // 1024} KB)")
-    sibling_dll = DIST_DIR / "DeliPlayer" / "libmpv-2.dll"
-    if not sibling_dll.is_file():
-        # Sometimes PyInstaller buries it under _internal; copy it up.
-        deep = DIST_DIR / "DeliPlayer" / "_internal" / "libmpv-2.dll"
-        if deep.is_file():
-            shutil.copy2(deep, sibling_dll)
-            print(f"Copied libmpv-2.dll up to {sibling_dll}")
-        else:
-            print(f"Warning: libmpv-2.dll not found at {sibling_dll}")
+
+    # PyInstaller drops --add-data and --add-binary content into _internal/.
+    # The runtime code (PROJECT_ROOT = exe.parent) expects libmpv-2.dll, luts/
+    # and assets/ at the bundle root, so lift them up.
+    deep_internal = bundle / "_internal"
+    for name in ("libmpv-2.dll", "luts", "assets"):
+        src = deep_internal / name
+        dst = bundle / name
+        if src.exists() and not dst.exists():
+            print(f"Lifting {name} from _internal/ to bundle root")
+            if src.is_dir():
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
     print()
     print("Next: register the .exe with Windows so Open With shows 'Deli Player':")
     print("  py -3.13 register_app.py")
