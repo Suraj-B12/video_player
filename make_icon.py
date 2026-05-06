@@ -76,7 +76,10 @@ def render(size: int) -> Image.Image:
 
 
 def _from_source_png(path: Path) -> Image.Image:
-    """Load a custom PNG, normalize to RGBA, force square crop."""
+    """Load a custom PNG, square-crop, and flatten transparency onto a
+    cream background that matches the deli artwork's interior. Without this
+    the rounded transparent corners look like missing pixels in dark Windows
+    menus (e.g. Open With on Win11 dark)."""
     img = Image.open(path).convert("RGBA")
     w, h = img.size
     if w != h:
@@ -84,7 +87,12 @@ def _from_source_png(path: Path) -> Image.Image:
         left = (w - s) // 2
         top = (h - s) // 2
         img = img.crop((left, top, left + s, top + s))
-    return img
+
+    # Composite onto a solid cream tile so the icon is opaque end-to-end.
+    cream = (244, 232, 213, 255)  # #F4E8D5 — matches the painted background
+    bg = Image.new("RGBA", img.size, cream)
+    bg.alpha_composite(img)
+    return bg
 
 
 def main() -> int:
