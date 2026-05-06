@@ -1393,7 +1393,8 @@ class PlayerWindow(QMainWindow):
         # Everything mpv held (cache RAM, decoder threads, audio device) is
         # released here. We also explicitly close any open child dialogs so
         # their worker threads (e.g. ClipInspector's metadata worker) don't
-        # outlive the main window.
+        # outlive the main window. Finally we wipe the composed-LUT cache
+        # so we don't leave files on disk after exit.
         for child in self.findChildren(QDialog):
             try:
                 child.close()
@@ -1401,6 +1402,13 @@ class PlayerWindow(QMainWindow):
                 pass
         try:
             self.player.terminate()
+        except Exception:
+            pass
+        try:
+            import shutil
+            composed = PROJECT_ROOT / "luts" / "_composed"
+            if composed.is_dir():
+                shutil.rmtree(composed, ignore_errors=True)
         except Exception:
             pass
         super().closeEvent(event)

@@ -86,17 +86,20 @@ def apply_to(player, *, cst: Path | None, look: Path | None) -> None:
     mpv loads the LUT under whatever type was previously set and may not
     re-evaluate when the type changes.
 
-    Two slots stack as a vf chain in this order:
-       source -> CST -> Look -> display
-    The CST takes the source colour space (e.g. S-Log3 / S-Gamut3.Cine) into
-    the Look's expected input space (Rec.709 for the bundled film LUTs).
-    Without CST first, applying a Rec.709-input creative LUT to S-Log3 pixels
-    looks wrong.
+    Stacking strategy:
+      - If both CST and Look are picked, we COMBINE them mathematically into
+        a single .cube file written to a cache dir, then load that one.
+      - If only one is picked, we load it directly.
+      - In both cases we use mpv's `lut` property with `lut-type=conversion`
+        (verified-working entry point that goes through the gpu pipeline,
+        unlike the `vf` command form which silently fails on this build).
 
-    Uses the same per-label remove+append pattern that worked in the
-    single-slot version (commit e40cc75) — extended to two slots. Avoids
-    `vf set` (atomic replacement) because that variant fails to take visible
-    effect on this libmpv build for reasons we couldn't isolate."""
+    Why combine instead of chain: mpv's `lut` property takes one LUT. The
+    `vf` command form CAN chain multiple via labelled lut3d filters, but on
+    libmpv 0.41 (shinchiro build, embedded `wid`) those vf changes return
+    error -12 (MPV_ERROR_COMMAND). Composing the two transforms into one
+    cube and loading it via `lut` gets us reliable single-LUT semantics
+    while still letting users stack creatively."""
     sys.stderr.write(f"[luts] cst={cst} look={look}\n")
 
     for path in (cst, look):
@@ -104,50 +107,152 @@ def apply_to(player, *, cst: Path | None, look: Path | None) -> None:
             sys.stderr.write(f"[luts] file does NOT exist: {path}\n")
             raise FileNotFoundError(path)
 
-    # Step 1 — remove our previous filters by label. mpv raises if the label
-    # isn't present; that's fine on first call. Includes the legacy
-    # `@playerlut` from earlier single-slot builds so an old install upgrades
-    # cleanly.
-    for label in ("@playercst", "@playerlook", "@playerlut"):
-        try:
-            player.command("vf", "remove", label)
-            sys.stderr.write(f"[luts] removed {label}\n")
-        except Exception:
-            pass
+    # Decide which single LUT to load.
+    target: Path | None
+    if cst is not None and look is not None:
+        target = _compose_cubes(cst, look)
+        sys.stderr.write(f"[luts] composed CST+Look into {target}\n")
+    else:
+        target = cst if cst is not None else look
 
-    # Step 2 — clear the legacy `lut` property in case an earlier code path
-    # stuck a value there.
-    try:
-        player["lut"] = ""
-    except Exception:
-        pass
-
-    # Step 3 — append fresh, one filter per slot. Same exact pattern as the
-    # working single-slot version: try `vf append` with a labelled lut3d
-    # filter and a single-quoted file path.
-    def _append_one(label: str, path: Path) -> None:
-        path_str = str(path).replace("\\", "/")
-        filter_str = f"{label}:lut3d=file='{path_str}':interp=tetrahedral"
+    if target is None:
         try:
-            player.command("vf", "append", filter_str)
-            sys.stderr.write(f"[luts] appended {label}\n")
+            player["lut"] = ""
+            sys.stderr.write("[luts] cleared\n")
         except Exception as e:
-            sys.stderr.write(f"[luts] append {label} FAILED: {type(e).__name__}: {e}\n")
-            raise
+            sys.stderr.write(f"[luts] clear failed: {e}\n")
+        return
 
-    if cst is not None:
-        _append_one("@playercst", cst)
-    if look is not None:
-        _append_one("@playerlook", look)
+    # Apply via the `lut` property (proven-working API for this libmpv build).
+    path_str = str(target).replace("\\", "/")
+    try:
+        player["lut-type"] = "conversion"
+        player["lut"] = path_str
+        sys.stderr.write(f"[luts] lut set OK: {path_str}\n")
+    except Exception as e:
+        sys.stderr.write(f"[luts] lut set FAILED: {type(e).__name__}: {e}\n")
+        raise
 
-    # Step 4 — force a re-render so the new filter chain takes effect
-    # immediately, even when the player is paused.
+    # Force a re-render so the change shows up even when paused.
     try:
         player.command("seek", "0", "relative-percent", "exact")
     except Exception:
         pass
 
-    sys.stderr.write("[luts] apply complete\n")
+
+def _read_cube(path: Path) -> tuple[int, list[tuple[float, float, float]]]:
+    """Parse an Adobe .cube 3D LUT. Returns (size, [(r,g,b), ...]) where
+    the values list is in cube-file order: r-fastest, then g, then b."""
+    size = 0
+    values: list[tuple[float, float, float]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith(("TITLE", "DOMAIN_MIN", "DOMAIN_MAX", "LUT_1D_INPUT_RANGE",
+                         "LUT_3D_INPUT_RANGE")):
+            continue
+        if s.startswith("LUT_3D_SIZE"):
+            size = int(s.split()[1])
+            continue
+        if s.startswith("LUT_1D_SIZE"):
+            raise ValueError(f"{path}: 1D LUTs not supported (need LUT_3D_SIZE)")
+        parts = s.split()
+        if len(parts) >= 3:
+            try:
+                values.append((float(parts[0]), float(parts[1]), float(parts[2])))
+            except ValueError:
+                continue
+    if size == 0:
+        raise ValueError(f"{path}: no LUT_3D_SIZE")
+    if len(values) != size * size * size:
+        raise ValueError(
+            f"{path}: expected {size**3} entries, got {len(values)}"
+        )
+    return size, values
+
+
+def _trilinear(values: list[tuple[float, float, float]], size: int,
+               r: float, g: float, b: float) -> tuple[float, float, float]:
+    """Trilinear interpolation through a 3D LUT. Input/output in [0, 1]."""
+    r = 0.0 if r < 0 else (1.0 if r > 1 else r)
+    g = 0.0 if g < 0 else (1.0 if g > 1 else g)
+    b = 0.0 if b < 0 else (1.0 if b > 1 else b)
+    n = size - 1
+    fx, fy, fz = r * n, g * n, b * n
+    x0, y0, z0 = int(fx), int(fy), int(fz)
+    x1 = min(x0 + 1, n)
+    y1 = min(y0 + 1, n)
+    z1 = min(z0 + 1, n)
+    dx, dy, dz = fx - x0, fy - y0, fz - z0
+
+    def at(x, y, z):
+        # cube file layout: r-fastest, g-medium, b-slowest
+        return values[z * size * size + y * size + x]
+
+    c000 = at(x0, y0, z0); c001 = at(x0, y0, z1)
+    c010 = at(x0, y1, z0); c011 = at(x0, y1, z1)
+    c100 = at(x1, y0, z0); c101 = at(x1, y0, z1)
+    c110 = at(x1, y1, z0); c111 = at(x1, y1, z1)
+
+    def lerp(a, b, t):
+        return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+
+    c00 = lerp(c000, c100, dx); c01 = lerp(c001, c101, dx)
+    c10 = lerp(c010, c110, dx); c11 = lerp(c011, c111, dx)
+    c0 = lerp(c00, c10, dy); c1 = lerp(c01, c11, dy)
+    res = lerp(c0, c1, dz)
+    return res  # type: ignore[return-value]
+
+
+_COMPOSE_CACHE: dict[tuple[str, str, float, float], Path] = {}
+
+
+def _compose_cubes(first: Path, second: Path, *, size: int = 33) -> Path:
+    """Compose two .cube LUTs: output(x) = second(first(x)). Cached on disk
+    so repeated picks are instant. Cache key includes both paths and their
+    mtimes so edits invalidate cleanly."""
+    cache_dir = LUTS_ROOT / "_composed"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    key = (str(first), str(second),
+           first.stat().st_mtime, second.stat().st_mtime)
+    cached = _COMPOSE_CACHE.get(key)
+    if cached and cached.is_file():
+        return cached
+
+    out_path = cache_dir / f"{first.stem}__then__{second.stem}.cube"
+    if out_path.is_file() and out_path.stat().st_mtime > max(
+        first.stat().st_mtime, second.stat().st_mtime
+    ):
+        _COMPOSE_CACHE[key] = out_path
+        return out_path
+
+    first_size, first_vals = _read_cube(first)
+    second_size, second_vals = _read_cube(second)
+
+    out_lines = [
+        f'TITLE "{first.stem} -> {second.stem}"',
+        f"LUT_3D_SIZE {size}",
+        "DOMAIN_MIN 0.0 0.0 0.0",
+        "DOMAIN_MAX 1.0 1.0 1.0",
+        "",
+    ]
+    denom = size - 1
+    for b_i in range(size):
+        for g_i in range(size):
+            for r_i in range(size):
+                r = r_i / denom; g = g_i / denom; b = b_i / denom
+                # Run through first cube, then second.
+                r2, g2, b2 = _trilinear(first_vals, first_size, r, g, b)
+                ro, go, bo = _trilinear(second_vals, second_size, r2, g2, b2)
+                ro = 0.0 if ro < 0 else (1.0 if ro > 1 else ro)
+                go = 0.0 if go < 0 else (1.0 if go > 1 else go)
+                bo = 0.0 if bo < 0 else (1.0 if bo > 1 else bo)
+                out_lines.append(f"{ro:.6f} {go:.6f} {bo:.6f}")
+    out_path.write_text("\n".join(out_lines), encoding="utf-8")
+    _COMPOSE_CACHE[key] = out_path
+    return out_path
 
 
 def clear(player) -> None:
