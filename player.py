@@ -20,8 +20,25 @@ import traceback
 from pathlib import Path
 
 # ─── Set up libmpv DLL search path BEFORE importing mpv ──────────────────────
-PROJECT_ROOT = Path(__file__).resolve().parent
-LIBMPV_DIR = PROJECT_ROOT / "vendor" / "libmpv"
+# When frozen by PyInstaller, all bundled data sits next to the executable
+# (vendor DLLs, luts/, assets/) — sys.executable.parent is the right anchor.
+# In source mode, the script's directory is.
+if getattr(sys, "frozen", False):
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent
+
+# libmpv-2.dll is bundled next to the exe in the frozen build, and inside
+# vendor/libmpv/ in source mode — try both.
+_LIBMPV_CANDIDATES = (
+    PROJECT_ROOT,                           # frozen build: dist/DeliPlayer/
+    PROJECT_ROOT / "vendor" / "libmpv",     # source: vendor/libmpv/
+    PROJECT_ROOT / "_internal",             # PyInstaller fallback
+)
+LIBMPV_DIR = next(
+    (d for d in _LIBMPV_CANDIDATES if (d / "libmpv-2.dll").is_file()),
+    PROJECT_ROOT / "vendor" / "libmpv",
+)
 
 
 def _bail(message: str) -> "None":
@@ -29,7 +46,7 @@ def _bail(message: str) -> "None":
     try:
         from PySide6.QtWidgets import QApplication, QMessageBox
         app = QApplication.instance() or QApplication(sys.argv)
-        QMessageBox.critical(None, "ffmpeg player", message)
+        QMessageBox.critical(None, "Deli Player", message)
     except Exception:
         sys.stderr.write(message + "\n")
     sys.exit(1)
@@ -568,7 +585,7 @@ class PropertiesDialog(QDialog):
 
 # ─── Main window ─────────────────────────────────────────────────────────────
 class PlayerWindow(QMainWindow):
-    APP_TITLE = "ffmpeg player"
+    APP_TITLE = "Deli Player"
 
     def __init__(self) -> None:
         super().__init__()
@@ -1215,8 +1232,8 @@ class PlayerWindow(QMainWindow):
             mpv_v = ff_v = "unknown"
         QMessageBox.information(
             self,
-            "About ffmpeg player",
-            f"<h3>ffmpeg player</h3>"
+            "About Deli Player",
+            f"<h3>Deli Player</h3>"
             f"<p>A libmpv-backed player for high-bit-depth professional footage.</p>"
             f"<p><b>libmpv:</b> {mpv_v}<br>"
             f"<b>FFmpeg:</b> {ff_v}<br>"
@@ -1393,8 +1410,10 @@ class PlayerWindow(QMainWindow):
 def main() -> int:
     # High-DPI is automatic in Qt6; nothing to configure for the PX13 OLED.
     app = QApplication(sys.argv)
-    app.setApplicationName("ffmpeg player")
-    app.setApplicationVersion("0.1.0")
+    app.setApplicationName("Deli Player")
+    app.setApplicationDisplayName("Deli Player")
+    app.setApplicationVersion("0.2.0")
+    app.setOrganizationName("DeliPlayer")
 
     icon_path = PROJECT_ROOT / "assets" / "icon.ico"
     if icon_path.is_file():

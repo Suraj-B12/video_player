@@ -1,20 +1,24 @@
 """
-Register this player with Windows so video files show "FFmpeg Player" in
+Register Deli Player with Windows so video files show "Deli Player" in
 the right-click "Open with" menu, and so you can set it as the default
 handler for video extensions.
 
     py -3.13 register_app.py             # install
     py -3.13 register_app.py --uninstall # remove
 
-Notes:
-  - Writes to HKEY_CURRENT_USER (no admin needed). Per-user only.
-  - Uses `pyw.exe` (Windows Python Launcher, no console window) so opening
-    a video doesn't flash a black terminal.
-  - Once registered, right-click any video → Open with → choose 'FFmpeg
-    Player'. Tick "Always use this app" to make it your default for that
-    extension. (Windows protects the actual default with a hash; programmatic
-    default-setting is unreliable, so the user must do that one click.)
-  - If you move the project folder, run this script again to update paths.
+Logic:
+  - If `dist\\DeliPlayer\\DeliPlayer.exe` exists (PyInstaller build), point
+    the registration at that real .exe. Windows then displays the .exe's
+    embedded FileDescription ("Deli Player") in Open With dialogs.
+  - Otherwise fall back to `pyw.exe player.py %1`. This works but Windows
+    will show "Python" as the friendly name in Open With, because that's
+    what pyw.exe identifies itself as.
+  - Writes to HKEY_CURRENT_USER (no admin needed).
+  - Once registered, right-click any video → Open with → choose 'Deli
+    Player'. Tick "Always use this app" to make it your default. Windows
+    protects the actual default with a hash so we can't bypass that one
+    click, but everything else is registered for you.
+  - If you move the project folder, re-run this script to update paths.
 """
 
 from __future__ import annotations
@@ -27,10 +31,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 PLAYER_PY = PROJECT_ROOT / "player.py"
 ICON_PATH = PROJECT_ROOT / "assets" / "icon.ico"
+PYINSTALLER_EXE = PROJECT_ROOT / "dist" / "DeliPlayer" / "DeliPlayer.exe"
+PYINSTALLER_EXE_ONEFILE = PROJECT_ROOT / "dist" / "DeliPlayer.exe"
 
-APP_PROGID = "Suraj.FFmpegPlayer"        # internal id Windows uses
-APP_FRIENDLY = "FFmpeg Player"           # what users see in menus
-APP_EXE_NAME = "ffmpegplayer.exe"        # virtual exe name under Applications\
+APP_PROGID = "Suraj.DeliPlayer"          # internal id Windows uses
+APP_FRIENDLY = "Deli Player"             # what users see in menus
+APP_EXE_NAME = "DeliPlayer.exe"          # virtual exe name under Applications\
 
 VIDEO_EXTS = (
     ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v",
@@ -55,14 +61,20 @@ def _resolve_pyw() -> str:
     raise SystemExit("Couldn't find pyw.exe or pythonw.exe. Install Python from python.org.")
 
 
-def _build_command(pyw: str) -> str:
-    """The shell command Windows runs when opening a video with us."""
-    # %1 is the file path Windows substitutes. Quote everything to handle
-    # paths with spaces.
-    if "py" in Path(pyw).name.lower() and Path(pyw).name.lower().startswith("pyw"):
-        # Windows Python Launcher — pin to 3.13 so we use the right interpreter.
-        return f'"{pyw}" -3.13 "{PLAYER_PY}" "%1"'
-    return f'"{pyw}" "{PLAYER_PY}" "%1"'
+def _build_command() -> tuple[str, str]:
+    """Return (command, exe_for_friendly_name).
+    Prefers the PyInstaller-built .exe when present (so Open With shows
+    'Deli Player'); falls back to pyw.exe (which Windows labels 'Python').
+    """
+    if PYINSTALLER_EXE.is_file():
+        return f'"{PYINSTALLER_EXE}" "%1"', str(PYINSTALLER_EXE)
+    if PYINSTALLER_EXE_ONEFILE.is_file():
+        return f'"{PYINSTALLER_EXE_ONEFILE}" "%1"', str(PYINSTALLER_EXE_ONEFILE)
+    pyw = _resolve_pyw()
+    if Path(pyw).name.lower().startswith("pyw") and "windows" in pyw.lower():
+        # Windows Python Launcher — pin to 3.13.
+        return f'"{pyw}" -3.13 "{PLAYER_PY}" "%1"', pyw
+    return f'"{pyw}" "{PLAYER_PY}" "%1"', pyw
 
 
 # ─── Install ─────────────────────────────────────────────────────────────────
@@ -72,14 +84,18 @@ def install() -> int:
     if not ICON_PATH.is_file():
         print(f"Warning: icon not found at {ICON_PATH}. Run make_icon.py first for a real icon.")
 
-    pyw = _resolve_pyw()
-    cmd = _build_command(pyw)
+    cmd, exe_path = _build_command()
     icon = str(ICON_PATH) if ICON_PATH.is_file() else ""
+    using_exe = exe_path.lower().endswith("deliplayer.exe")
 
     print(f"Registering '{APP_FRIENDLY}' under HKEY_CURRENT_USER")
-    print(f"  python launcher: {pyw}")
+    print(f"  using:           {exe_path}")
     print(f"  command:         {cmd}")
     print(f"  icon:            {icon or '(none)'}")
+    if not using_exe:
+        print()
+        print("  NOTE: Falling back to pyw.exe; Open With will say 'Python' until")
+        print("        you build DeliPlayer.exe via:  py -3.13 build_exe.py")
 
     # 1) Application entry under Software\Classes\Applications\<exe>
     app_root = rf"Software\Classes\Applications\{APP_EXE_NAME}"

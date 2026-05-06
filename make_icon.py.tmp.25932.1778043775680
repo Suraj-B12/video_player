@@ -75,29 +75,11 @@ def render(size: int) -> Image.Image:
     return img
 
 
-def _from_source_png(path: Path) -> Image.Image:
-    """Load a custom PNG, normalize to RGBA, force square crop."""
-    img = Image.open(path).convert("RGBA")
-    w, h = img.size
-    if w != h:
-        s = min(w, h)
-        left = (w - s) // 2
-        top = (h - s) // 2
-        img = img.crop((left, top, left + s, top + s))
-    return img
-
-
 def main() -> int:
-    ASSETS.mkdir(parents=True, exist_ok=True)
+    OUT.parent.mkdir(parents=True, exist_ok=True)
     sizes = [256, 128, 96, 64, 48, 32, 24, 16]
-
-    if SOURCE_PNG.is_file():
-        print(f"Using custom source: {SOURCE_PNG}")
-        base = _from_source_png(SOURCE_PNG).resize((256, 256), Image.LANCZOS)
-    else:
-        print("No custom source found at assets/icon_source.png — generating placeholder.")
-        base = render(256)
-
+    images = [render(s) for s in sizes]
+    base = images[0]
     base.save(OUT, format="ICO", sizes=[(s, s) for s in sizes])
     base.save(PNG_OUT, format="PNG")
     print(f"Wrote {OUT}  ({', '.join(f'{s}x{s}' for s in sizes)})")

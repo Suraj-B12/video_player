@@ -10,7 +10,11 @@ venv/
 build/
 dist/
 *.spec
+DeliPlayer.spec
 
 vendor/libmpv/
 *.7z
 *.log
+
+# Optional user-supplied source for the icon (generated outputs are tracked).
+assets/icon_source.png

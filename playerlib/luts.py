@@ -21,7 +21,11 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# PyInstaller-aware: in a frozen build, luts/ sits next to the exe.
+if getattr(sys, "frozen", False):
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LUTS_ROOT = PROJECT_ROOT / "luts"
 
 # Categories the UI cares about; ordering = display order.
@@ -89,43 +93,58 @@ def apply_to(player, *, cst: Path | None, look: Path | None) -> None:
     Without CST first, applying a Rec.709-input creative LUT to S-Log3 pixels
     looks wrong (over-saturated, crushed shadows).
 
-    Filters use the `vf` command (not property-set, which rejects strings on
-    this libmpv build) and a labelled name (@playercst / @playerlook) so each
-    slot can be replaced or cleared independently."""
-    sys.stderr.write(f"[luts] applying cst={cst} look={look}\n")
+    Uses `vf set` (atomic replacement of the whole filter chain) instead of
+    incremental remove+append cycles — the latter can leave the chain stuck
+    in a half-applied state on some libmpv builds when the previous label
+    isn't there to remove.
+
+    Filter syntax: each filter is prefixed with `@<label>:` so we own it
+    explicitly. Paths are single-quoted to escape the colon in C:/."""
+    sys.stderr.write(f"[luts] cst={cst} look={look}\n")
 
     for path in (cst, look):
         if path is not None and not Path(path).is_file():
             sys.stderr.write(f"[luts] file does NOT exist: {path}\n")
             raise FileNotFoundError(path)
 
-    # Clear our previous filters. `remove` errors silently when label absent.
-    for label in ("@playercst", "@playerlook"):
-        try:
-            player.command("vf", "remove", label)
-        except Exception:
-            pass
+    parts: list[str] = []
+    if cst is not None:
+        cst_path = str(cst).replace("\\", "/")
+        parts.append(f"@playercst:lut3d=file='{cst_path}':interp=tetrahedral")
+    if look is not None:
+        look_path = str(look).replace("\\", "/")
+        parts.append(f"@playerlook:lut3d=file='{look_path}':interp=tetrahedral")
 
-    # Belt-and-suspenders: also clear the lut property in case a previous
-    # version of this code set it and left it stuck.
+    chain = ",".join(parts)
+    sys.stderr.write(f"[luts] vf set -> {chain!r}\n")
+
+    # Clear the legacy `lut` property in case an earlier version stuck a
+    # value there.
     try:
         player["lut"] = ""
     except Exception:
         pass
 
-    def _append(label: str, path: Path) -> None:
-        path_str = str(path).replace("\\", "/")
-        filter_str = f"{label}:lut3d=file='{path_str}':interp=tetrahedral"
-        player.command("vf", "append", filter_str)
-        sys.stderr.write(f"[luts] vf append OK: {filter_str}\n")
+    try:
+        player.command("vf", "set", chain)
+        sys.stderr.write("[luts] vf set OK\n")
+    except Exception as e:
+        sys.stderr.write(f"[luts] vf set failed: {type(e).__name__}: {e}\n")
+        # Fallback: try the older append-with-clear approach.
+        try:
+            player.command("vf", "clr")
+            for f in parts:
+                player.command("vf", "append", f)
+            sys.stderr.write("[luts] fell back to clr+append OK\n")
+        except Exception as e2:
+            sys.stderr.write(f"[luts] fallback also failed: {e2}\n")
+            raise
 
-    if cst is not None:
-        _append("@playercst", cst)
-    if look is not None:
-        _append("@playerlook", look)
-
-    if cst is None and look is None:
-        sys.stderr.write("[luts] chain empty\n")
+    # Force a re-render so the filter takes effect immediately even if paused.
+    try:
+        player.command("seek", "0", "relative-percent", "exact")
+    except Exception:
+        pass
 
 
 def clear(player) -> None:
