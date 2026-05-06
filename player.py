@@ -19,6 +19,16 @@ import sys
 import traceback
 from pathlib import Path
 
+# When PyInstaller --windowed bundles run a real GUI launch (double-click /
+# Open With) Windows attaches no console, so sys.stdout / sys.stderr are
+# None. Any subsequent .write() crashes the process before the window can
+# even appear. Redirect both to NUL so logging is harmless. MUST happen
+# before any module imports that may write to stderr (luts, inspector, ...).
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+
 # ─── Set up libmpv DLL search path BEFORE importing mpv ──────────────────────
 # When frozen by PyInstaller, all bundled data sits next to the executable
 # (vendor DLLs, luts/, assets/) — sys.executable.parent is the right anchor.
