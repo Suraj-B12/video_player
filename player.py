@@ -634,7 +634,11 @@ class PlayerWindow(QMainWindow):
 
     def _build_status_bar(self) -> None:
         self.status: QStatusBar = self.statusBar()
-        self.status.showMessage("Ready — open a video to start (Ctrl+O)")
+        # Permanent label keeps file info visible even when a transient toast
+        # message is shown via showMessage().
+        self._info_label = QLabel("Ready  -  open a video (Ctrl+O)")
+        self._info_label.setStyleSheet("padding-left: 6px;")
+        self.status.addWidget(self._info_label, 1)
 
     def _build_player(self) -> None:
         # Force the QFrame to materialise a real Win32 HWND now, before mpv
@@ -1090,32 +1094,54 @@ class PlayerWindow(QMainWindow):
             self.apply_look(Path(path_str))
 
     def apply_cst(self, path: Path | None) -> None:
-        """Set the Color Space Transform slot. None clears it."""
+        """Set the Color Space Transform LUT. Mutually exclusive with Look —
+        picking one clears the other (single-slot model uses mpv's `lut`
+        property, which is reliable but only holds one LUT at a time)."""
         if path is not None and not path.is_file():
             self._show_error(f"LUT not found: {path}")
             return
         self._cst_lut = path
+        if path is not None:
+            self._look_lut = None
+            self._tick_none(self._look_action_group)
         self._refresh_lut_chain()
+        self._update_status()
         if path:
             self._show_osd(f"CST: {path.stem}")
-            self.status.showMessage(f"CST applied: {path.name}", 4000)
         else:
             self._show_osd("CST cleared")
-            self.status.showMessage("CST cleared", 3000)
+        # Force a re-render so the new LUT shows immediately even when paused.
+        try:
+            self.player.command("seek", "0", "relative-percent", "exact")
+        except Exception:
+            pass
 
     def apply_look(self, path: Path | None) -> None:
-        """Set the Look LUT slot. None clears it."""
+        """Set the Look LUT. Mutually exclusive with CST."""
         if path is not None and not path.is_file():
             self._show_error(f"LUT not found: {path}")
             return
         self._look_lut = path
+        if path is not None:
+            self._cst_lut = None
+            self._tick_none(self._cst_action_group)
         self._refresh_lut_chain()
+        self._update_status()
         if path:
             self._show_osd(f"Look: {path.stem}")
-            self.status.showMessage(f"Look applied: {path.name}", 4000)
         else:
             self._show_osd("Look cleared")
-            self.status.showMessage("Look cleared", 3000)
+        try:
+            self.player.command("seek", "0", "relative-percent", "exact")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _tick_none(group: QActionGroup) -> None:
+        for act in group.actions():
+            if act.text() == "None":
+                act.setChecked(True)
+                return
 
     def clear_all_luts(self) -> None:
         self._cst_lut = None
@@ -1293,8 +1319,6 @@ class PlayerWindow(QMainWindow):
         vp = self._video_params
         w = vp.get("w") or vp.get("dw")
         h = vp.get("h") or vp.get("dh")
-        # video-codec / hwdec-current aren't observed yet; safe to read once
-        # since they don't change during steady-state playback.
         try:
             codec = self.player.video_codec or "?"
         except Exception:
@@ -1305,9 +1329,11 @@ class PlayerWindow(QMainWindow):
             hwdec = "?"
         res = f"{w}x{h}" if w and h else "?"
         dur_str = _fmt_seconds(self._duration) if self._duration else "?"
-        self.status.showMessage(
+        active_lut = self._cst_lut or self._look_lut
+        lut_part = f"   |   LUT: {active_lut.stem}" if active_lut else ""
+        self._info_label.setText(
             f"{self._current_file.name}   |   {res}   |   {codec}   |   "
-            f"hwdec: {hwdec}   |   {dur_str}"
+            f"hwdec: {hwdec}   |   {dur_str}{lut_part}"
         )
 
     # ── Drag-and-drop ────────────────────────────────────────────────────────

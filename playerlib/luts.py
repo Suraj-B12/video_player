@@ -73,33 +73,41 @@ def discover() -> dict[str, list[Lut]]:
     return out
 
 
-def _escape_for_mpv_filter(path: Path) -> str:
-    """Escape a Windows path for mpv's filter argument syntax.
-    Colons are filter-arg separators, so `C:\\` must become `C\\:/`."""
-    s = str(path).replace("\\", "/")
-    # Escape colon so mpv's lavfi parser doesn't split on `C:`.
-    return s.replace(":", "\\:")
-
-
-def build_vf_chain(cst: Path | None, look: Path | None) -> str:
-    """Compose mpv's `vf` value for the active LUT slots.
-    Both LUTs use tetrahedral interpolation — better for log sources than
-    the default trilinear when stretching the upper highlights."""
-    parts: list[str] = []
-    if cst is not None:
-        parts.append(f"lut3d=file={_escape_for_mpv_filter(cst)}:interp=tetrahedral")
-    if look is not None:
-        parts.append(f"lut3d=file={_escape_for_mpv_filter(look)}:interp=tetrahedral")
-    return ",".join(parts)
-
-
 def apply_to(player, *, cst: Path | None, look: Path | None) -> None:
-    """Push the combined filter chain into mpv. Empty string clears all LUTs."""
-    chain = build_vf_chain(cst, look)
+    """Apply the active LUT to mpv via the `lut` property (GPU pipeline).
+    Single-slot for now: when both CST and Look are set, CST wins. True
+    stacking would require composing the two .cube files into one.
+
+    Order of property writes matters: set `lut-type` BEFORE `lut`, otherwise
+    mpv loads the LUT under whatever type was previously set and may not
+    re-evaluate when the type changes.
+
+    `lut-type=native` is correct for our LUTs: input and output are both
+    code-value RGB (S-Log3 encoded → Rec.709 encoded), not scene-linear."""
+    active = cst if cst is not None else look
+    sys.stderr.write(f"[luts] applying: {active}\n")
+
+    if active is not None and not Path(active).is_file():
+        sys.stderr.write(f"[luts] file does NOT exist: {active}\n")
+
     try:
-        player["vf"] = chain
+        if active is not None:
+            path_str = str(active).replace("\\", "/")
+            # lut-type first — see docstring.
+            player["lut-type"] = "native"
+            player["lut"] = path_str
+            # Read back so we know mpv accepted the values.
+            try:
+                got_lut = player["lut"]
+                got_type = player["lut-type"]
+                sys.stderr.write(f"[luts] mpv reports lut={got_lut!r} type={got_type!r}\n")
+            except Exception as e:
+                sys.stderr.write(f"[luts] read-back failed: {e}\n")
+        else:
+            player["lut"] = ""
+            sys.stderr.write("[luts] lut cleared\n")
     except Exception as e:
-        sys.stderr.write(f"[luts] failed to set vf chain {chain!r}: {e}\n")
+        sys.stderr.write(f"[luts] set failed: {type(e).__name__}: {e}\n")
         raise
 
 
