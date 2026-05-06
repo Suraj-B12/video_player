@@ -82,32 +82,46 @@ def apply_to(player, *, cst: Path | None, look: Path | None) -> None:
     mpv loads the LUT under whatever type was previously set and may not
     re-evaluate when the type changes.
 
-    `lut-type=native` is correct for our LUTs: input and output are both
-    code-value RGB (S-Log3 encoded → Rec.709 encoded), not scene-linear."""
+    Implementation: we drop the LUT into the video filter chain via the
+    `vf` command (NOT the `vf` property — property-set rejects the string
+    form on this libmpv build). The labelled filter `@playerlut:...` makes
+    it easy to remove on switch/clear.
+
+    The path is single-quoted in the filter argument so the colon in `C:/`
+    doesn't get parsed as a filter-arg separator."""
     active = cst if cst is not None else look
     sys.stderr.write(f"[luts] applying: {active}\n")
 
     if active is not None and not Path(active).is_file():
         sys.stderr.write(f"[luts] file does NOT exist: {active}\n")
+        raise FileNotFoundError(active)
 
+    # Clear any previous LUT we installed. `remove` errors if the label
+    # isn't there — that's fine on first call.
     try:
-        if active is not None:
-            path_str = str(active).replace("\\", "/")
-            # lut-type first — see docstring.
-            player["lut-type"] = "native"
-            player["lut"] = path_str
-            # Read back so we know mpv accepted the values.
-            try:
-                got_lut = player["lut"]
-                got_type = player["lut-type"]
-                sys.stderr.write(f"[luts] mpv reports lut={got_lut!r} type={got_type!r}\n")
-            except Exception as e:
-                sys.stderr.write(f"[luts] read-back failed: {e}\n")
-        else:
-            player["lut"] = ""
-            sys.stderr.write("[luts] lut cleared\n")
+        player.command("vf", "remove", "@playerlut")
+        sys.stderr.write("[luts] removed previous @playerlut\n")
+    except Exception:
+        pass
+
+    # Also clear the `lut` property in case an older build of this code set
+    # it; otherwise we'd double-apply.
+    try:
+        player["lut"] = ""
+    except Exception:
+        pass
+
+    if active is None:
+        sys.stderr.write("[luts] no active LUT, chain is now empty\n")
+        return
+
+    path_str = str(active).replace("\\", "/")
+    filter_str = f"@playerlut:lut3d=file='{path_str}':interp=tetrahedral"
+    try:
+        player.command("vf", "append", filter_str)
+        sys.stderr.write(f"[luts] vf append OK: {filter_str}\n")
     except Exception as e:
-        sys.stderr.write(f"[luts] set failed: {type(e).__name__}: {e}\n")
+        sys.stderr.write(f"[luts] vf append failed: {type(e).__name__}: {e}\n")
         raise
 
 
