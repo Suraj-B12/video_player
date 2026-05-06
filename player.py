@@ -55,7 +55,7 @@ _prepare_libmpv()
 
 # ─── Imports that depend on libmpv/Qt being ready ────────────────────────────
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QUrl
-from PySide6.QtGui import QAction, QActionGroup, QDragEnterEvent, QDropEvent, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QActionGroup, QDragEnterEvent, QDropEvent, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -651,6 +651,14 @@ class PlayerWindow(QMainWindow):
             self.player = mpv.MPV(
                 # Embedding
                 wid=str(hwnd),
+
+                # No state spillage to disk. Don't load %APPDATA%\mpv\mpv.conf,
+                # don't write resume files, don't open a log file. Everything
+                # the player needs for a session lives in this process.
+                config=False,
+                save_position_on_quit=False,
+                log_file="",
+                terminal=False,
 
                 # Output chain — falls back gracefully if no GPU/GL.
                 vo=VO_FALLBACK_CHAIN,
@@ -1365,6 +1373,15 @@ class PlayerWindow(QMainWindow):
     # ── Lifecycle ────────────────────────────────────────────────────────────
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
         # Tear down libmpv cleanly so the process exits without a hang.
+        # Everything mpv held (cache RAM, decoder threads, audio device) is
+        # released here. We also explicitly close any open child dialogs so
+        # their worker threads (e.g. ClipInspector's metadata worker) don't
+        # outlive the main window.
+        for child in self.findChildren(QDialog):
+            try:
+                child.close()
+            except Exception:
+                pass
         try:
             self.player.terminate()
         except Exception:
@@ -1378,6 +1395,11 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("ffmpeg player")
     app.setApplicationVersion("0.1.0")
+
+    icon_path = PROJECT_ROOT / "assets" / "icon.ico"
+    if icon_path.is_file():
+        icon = QIcon(str(icon_path))
+        app.setWindowIcon(icon)
 
     # Last-resort exception handler — keep the UI alive on background errors.
     def _excepthook(exctype, value, tb):
