@@ -82,47 +82,50 @@ def apply_to(player, *, cst: Path | None, look: Path | None) -> None:
     mpv loads the LUT under whatever type was previously set and may not
     re-evaluate when the type changes.
 
-    Implementation: we drop the LUT into the video filter chain via the
-    `vf` command (NOT the `vf` property — property-set rejects the string
-    form on this libmpv build). The labelled filter `@playerlut:...` makes
-    it easy to remove on switch/clear.
+    Two slots stack as a vf chain in this order:
+       source -> CST -> Look -> display
+    The CST takes the source colour space (e.g. S-Log3 / S-Gamut3.Cine) into
+    the Look's expected input space (Rec.709 for the bundled film LUTs).
+    Without CST first, applying a Rec.709-input creative LUT to S-Log3 pixels
+    looks wrong (over-saturated, crushed shadows).
 
-    The path is single-quoted in the filter argument so the colon in `C:/`
-    doesn't get parsed as a filter-arg separator."""
-    active = cst if cst is not None else look
-    sys.stderr.write(f"[luts] applying: {active}\n")
+    Filters use the `vf` command (not property-set, which rejects strings on
+    this libmpv build) and a labelled name (@playercst / @playerlook) so each
+    slot can be replaced or cleared independently."""
+    sys.stderr.write(f"[luts] applying cst={cst} look={look}\n")
 
-    if active is not None and not Path(active).is_file():
-        sys.stderr.write(f"[luts] file does NOT exist: {active}\n")
-        raise FileNotFoundError(active)
+    for path in (cst, look):
+        if path is not None and not Path(path).is_file():
+            sys.stderr.write(f"[luts] file does NOT exist: {path}\n")
+            raise FileNotFoundError(path)
 
-    # Clear any previous LUT we installed. `remove` errors if the label
-    # isn't there — that's fine on first call.
-    try:
-        player.command("vf", "remove", "@playerlut")
-        sys.stderr.write("[luts] removed previous @playerlut\n")
-    except Exception:
-        pass
+    # Clear our previous filters. `remove` errors silently when label absent.
+    for label in ("@playercst", "@playerlook"):
+        try:
+            player.command("vf", "remove", label)
+        except Exception:
+            pass
 
-    # Also clear the `lut` property in case an older build of this code set
-    # it; otherwise we'd double-apply.
+    # Belt-and-suspenders: also clear the lut property in case a previous
+    # version of this code set it and left it stuck.
     try:
         player["lut"] = ""
     except Exception:
         pass
 
-    if active is None:
-        sys.stderr.write("[luts] no active LUT, chain is now empty\n")
-        return
-
-    path_str = str(active).replace("\\", "/")
-    filter_str = f"@playerlut:lut3d=file='{path_str}':interp=tetrahedral"
-    try:
+    def _append(label: str, path: Path) -> None:
+        path_str = str(path).replace("\\", "/")
+        filter_str = f"{label}:lut3d=file='{path_str}':interp=tetrahedral"
         player.command("vf", "append", filter_str)
         sys.stderr.write(f"[luts] vf append OK: {filter_str}\n")
-    except Exception as e:
-        sys.stderr.write(f"[luts] vf append failed: {type(e).__name__}: {e}\n")
-        raise
+
+    if cst is not None:
+        _append("@playercst", cst)
+    if look is not None:
+        _append("@playerlook", look)
+
+    if cst is None and look is None:
+        sys.stderr.write("[luts] chain empty\n")
 
 
 def clear(player) -> None:

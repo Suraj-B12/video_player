@@ -1042,6 +1042,7 @@ class PlayerWindow(QMainWindow):
         # Helper to add a LUT radio item.
         def add_lut(menu: QMenu, group: QActionGroup, lut, on_select) -> None:
             act = QAction(lut.name, self, checkable=True)
+            act.setData(str(lut.path))  # for path-based programmatic ticking
             act.triggered.connect(lambda _checked, p=lut.path: on_select(p))
             group.addAction(act)
             menu.addAction(act)
@@ -1093,48 +1094,39 @@ class PlayerWindow(QMainWindow):
         if path_str:
             self.apply_look(Path(path_str))
 
+    DEFAULT_CST_FOR_LOOK = (
+        PROJECT_ROOT / "luts" / "conversions" / "SLog3_SGamut3Cine_to_Rec709.cube"
+    )
+
     def apply_cst(self, path: Path | None) -> None:
-        """Set the Color Space Transform LUT. Mutually exclusive with Look —
-        picking one clears the other (single-slot model uses mpv's `lut`
-        property, which is reliable but only holds one LUT at a time)."""
+        """Set the Color Space Transform LUT. Stacks with Look LUT."""
         if path is not None and not path.is_file():
             self._show_error(f"LUT not found: {path}")
             return
         self._cst_lut = path
-        if path is not None:
-            self._look_lut = None
-            self._tick_none(self._look_action_group)
         self._refresh_lut_chain()
         self._update_status()
-        if path:
-            self._show_osd(f"CST: {path.stem}")
-        else:
-            self._show_osd("CST cleared")
-        # Force a re-render so the new LUT shows immediately even when paused.
-        try:
-            self.player.command("seek", "0", "relative-percent", "exact")
-        except Exception:
-            pass
+        self._show_osd(f"CST: {path.stem}" if path else "CST cleared")
 
     def apply_look(self, path: Path | None) -> None:
-        """Set the Look LUT. Mutually exclusive with CST."""
+        """Set the Look LUT. Auto-applies the default S-Log3 -> Rec.709 CST
+        first if no CST is set, because cinematic LUTs (Kodak, Fuji, etc.)
+        expect Rec.709 input — applying them to raw S-Log3 looks broken."""
         if path is not None and not path.is_file():
             self._show_error(f"LUT not found: {path}")
             return
         self._look_lut = path
-        if path is not None:
-            self._cst_lut = None
-            self._tick_none(self._cst_action_group)
+
+        if path is not None and self._cst_lut is None and self.DEFAULT_CST_FOR_LOOK.is_file():
+            # Auto-apply default S-Log3 -> Rec.709 conversion so the look
+            # LUT actually looks right on log-encoded source.
+            self._cst_lut = self.DEFAULT_CST_FOR_LOOK
+            self._tick_action_with_path(self._cst_action_group, self.DEFAULT_CST_FOR_LOOK)
+            self.status.showMessage("Auto-applied S-Log3 -> Rec.709 CST under the look", 4000)
+
         self._refresh_lut_chain()
         self._update_status()
-        if path:
-            self._show_osd(f"Look: {path.stem}")
-        else:
-            self._show_osd("Look cleared")
-        try:
-            self.player.command("seek", "0", "relative-percent", "exact")
-        except Exception:
-            pass
+        self._show_osd(f"Look: {path.stem}" if path else "Look cleared")
 
     @staticmethod
     def _tick_none(group: QActionGroup) -> None:
@@ -1142,6 +1134,20 @@ class PlayerWindow(QMainWindow):
             if act.text() == "None":
                 act.setChecked(True)
                 return
+
+    @staticmethod
+    def _tick_action_with_path(group: QActionGroup, path: Path) -> None:
+        """Tick the radio item whose data() (the LUT path) matches `path`."""
+        for act in group.actions():
+            data = act.data()
+            if data is None:
+                continue
+            try:
+                if Path(data) == path:
+                    act.setChecked(True)
+                    return
+            except (TypeError, ValueError):
+                continue
 
     def clear_all_luts(self) -> None:
         self._cst_lut = None
