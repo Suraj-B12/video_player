@@ -1407,7 +1407,21 @@ class PlayerWindow(QMainWindow):
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
+def _set_taskbar_app_id() -> None:
+    """Tell Windows to identify this process as 'Deli Player' for taskbar
+    grouping and icon assignment. Without this, the taskbar uses the .exe
+    metadata's icon (or the python interpreter's icon when running from
+    source), and the WindowIcon we set on Qt may be ignored."""
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("DeliPlayer.0.2")
+    except Exception:
+        pass
+
+
 def main() -> int:
+    _set_taskbar_app_id()
+
     # High-DPI is automatic in Qt6; nothing to configure for the PX13 OLED.
     app = QApplication(sys.argv)
     app.setApplicationName("Deli Player")
@@ -1415,9 +1429,18 @@ def main() -> int:
     app.setApplicationVersion("0.2.0")
     app.setOrganizationName("DeliPlayer")
 
-    icon_path = PROJECT_ROOT / "assets" / "icon.ico"
-    if icon_path.is_file():
-        icon = QIcon(str(icon_path))
+    # Load the icon — try .ico first (multi-size, sharp at every scale), then
+    # fall back to .png. Qt's QIcon takes either.
+    icon: QIcon | None = None
+    for candidate in (PROJECT_ROOT / "assets" / "icon.ico",
+                      PROJECT_ROOT / "assets" / "icon.png"):
+        if candidate.is_file():
+            icon = QIcon(str(candidate))
+            sys.stderr.write(f"[icon] loaded {candidate}\n")
+            break
+    if icon is None:
+        sys.stderr.write(f"[icon] NOT FOUND at {PROJECT_ROOT}/assets/\n")
+    else:
         app.setWindowIcon(icon)
 
     # Last-resort exception handler — keep the UI alive on background errors.
@@ -1429,6 +1452,8 @@ def main() -> int:
     sys.excepthook = _excepthook
 
     win = PlayerWindow()
+    if icon is not None:
+        win.setWindowIcon(icon)
     win.show()
 
     # If a path was passed as argv[1], open it.

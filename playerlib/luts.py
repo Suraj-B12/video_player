@@ -91,15 +91,12 @@ def apply_to(player, *, cst: Path | None, look: Path | None) -> None:
     The CST takes the source colour space (e.g. S-Log3 / S-Gamut3.Cine) into
     the Look's expected input space (Rec.709 for the bundled film LUTs).
     Without CST first, applying a Rec.709-input creative LUT to S-Log3 pixels
-    looks wrong (over-saturated, crushed shadows).
+    looks wrong.
 
-    Uses `vf set` (atomic replacement of the whole filter chain) instead of
-    incremental remove+append cycles — the latter can leave the chain stuck
-    in a half-applied state on some libmpv builds when the previous label
-    isn't there to remove.
-
-    Filter syntax: each filter is prefixed with `@<label>:` so we own it
-    explicitly. Paths are single-quoted to escape the colon in C:/."""
+    Uses the same per-label remove+append pattern that worked in the
+    single-slot version (commit e40cc75) — extended to two slots. Avoids
+    `vf set` (atomic replacement) because that variant fails to take visible
+    effect on this libmpv build for reasons we couldn't isolate."""
     sys.stderr.write(f"[luts] cst={cst} look={look}\n")
 
     for path in (cst, look):
@@ -107,44 +104,50 @@ def apply_to(player, *, cst: Path | None, look: Path | None) -> None:
             sys.stderr.write(f"[luts] file does NOT exist: {path}\n")
             raise FileNotFoundError(path)
 
-    parts: list[str] = []
-    if cst is not None:
-        cst_path = str(cst).replace("\\", "/")
-        parts.append(f"@playercst:lut3d=file='{cst_path}':interp=tetrahedral")
-    if look is not None:
-        look_path = str(look).replace("\\", "/")
-        parts.append(f"@playerlook:lut3d=file='{look_path}':interp=tetrahedral")
+    # Step 1 — remove our previous filters by label. mpv raises if the label
+    # isn't present; that's fine on first call. Includes the legacy
+    # `@playerlut` from earlier single-slot builds so an old install upgrades
+    # cleanly.
+    for label in ("@playercst", "@playerlook", "@playerlut"):
+        try:
+            player.command("vf", "remove", label)
+            sys.stderr.write(f"[luts] removed {label}\n")
+        except Exception:
+            pass
 
-    chain = ",".join(parts)
-    sys.stderr.write(f"[luts] vf set -> {chain!r}\n")
-
-    # Clear the legacy `lut` property in case an earlier version stuck a
-    # value there.
+    # Step 2 — clear the legacy `lut` property in case an earlier code path
+    # stuck a value there.
     try:
         player["lut"] = ""
     except Exception:
         pass
 
-    try:
-        player.command("vf", "set", chain)
-        sys.stderr.write("[luts] vf set OK\n")
-    except Exception as e:
-        sys.stderr.write(f"[luts] vf set failed: {type(e).__name__}: {e}\n")
-        # Fallback: try the older append-with-clear approach.
+    # Step 3 — append fresh, one filter per slot. Same exact pattern as the
+    # working single-slot version: try `vf append` with a labelled lut3d
+    # filter and a single-quoted file path.
+    def _append_one(label: str, path: Path) -> None:
+        path_str = str(path).replace("\\", "/")
+        filter_str = f"{label}:lut3d=file='{path_str}':interp=tetrahedral"
         try:
-            player.command("vf", "clr")
-            for f in parts:
-                player.command("vf", "append", f)
-            sys.stderr.write("[luts] fell back to clr+append OK\n")
-        except Exception as e2:
-            sys.stderr.write(f"[luts] fallback also failed: {e2}\n")
+            player.command("vf", "append", filter_str)
+            sys.stderr.write(f"[luts] appended {label}\n")
+        except Exception as e:
+            sys.stderr.write(f"[luts] append {label} FAILED: {type(e).__name__}: {e}\n")
             raise
 
-    # Force a re-render so the filter takes effect immediately even if paused.
+    if cst is not None:
+        _append_one("@playercst", cst)
+    if look is not None:
+        _append_one("@playerlook", look)
+
+    # Step 4 — force a re-render so the new filter chain takes effect
+    # immediately, even when the player is paused.
     try:
         player.command("seek", "0", "relative-percent", "exact")
     except Exception:
         pass
+
+    sys.stderr.write("[luts] apply complete\n")
 
 
 def clear(player) -> None:

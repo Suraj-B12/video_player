@@ -1,0 +1,37 @@
+# UTF-8
+#
+# Windows PE version info embedded into DeliPlayer.exe by PyInstaller's
+# --version-file flag. This is what "Open With" shows as the friendly app
+# name and what File Explorer shows in the file's Properties dialog.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(0, 2, 0, 0),
+    prodvers=(0, 2, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '040904B0',
+          [
+            StringStruct('CompanyName', 'DeliPlayer'),
+            StringStruct('FileDescription', 'Deli Player'),
+            StringStruct('FileVersion', '0.2.0.0'),
+            StringStruct('InternalName', 'DeliPlayer'),
+            StringStruct('LegalCopyright', ''),
+            StringStruct('OriginalFilename', 'DeliPlayer.exe'),
+            StringStruct('ProductName', 'Deli Player'),
+            StringStruct('ProductVersion', '0.2.0.0'),
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)

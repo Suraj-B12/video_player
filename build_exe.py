@@ -67,6 +67,7 @@ def clean() -> None:
 def build() -> None:
     # PyInstaller's --add-data uses ';' as src/dest separator on Windows.
     sep = ";"
+    version_file = PROJECT_ROOT / "version_info.txt"
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm",
@@ -82,8 +83,13 @@ def build() -> None:
         # Hidden imports — PyInstaller can miss runtime ctypes loads.
         "--hidden-import", "mpv",
         "--collect-submodules", "playerlib",
-        str(PLAYER_PY),
     ]
+    # Embed Windows PE version info so File Explorer's "Open with" dialog
+    # picks up "Deli Player" from the .exe metadata instead of falling back
+    # to "Python" (which is what pyw.exe identifies itself as).
+    if version_file.is_file():
+        cmd += ["--version-file", str(version_file)]
+    cmd.append(str(PLAYER_PY))
     print("Running:")
     print("  " + " ".join(f'"{a}"' if " " in a else a for a in cmd))
     print()
