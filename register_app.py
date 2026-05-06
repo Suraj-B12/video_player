@@ -124,7 +124,7 @@ def install() -> int:
     print()
     print("Done.")
     print()
-    print("Right-click any video file -> Open with -> 'FFmpeg Player'.")
+    print(f"Right-click any video file -> Open with -> '{APP_FRIENDLY}'.")
     print("Tick 'Always use this app' to make it the default for that extension.")
     return 0
 
